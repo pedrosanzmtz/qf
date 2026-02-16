@@ -15,6 +15,10 @@ pub fn format_value(value: &Value, format: Format, compact: bool, raw: bool) -> 
     match format {
         Format::Json => format_json(value, compact),
         Format::Yaml => format_yaml(value),
+        Format::Xml => format_xml(value),
+        Format::Toml => format_toml(value),
+        Format::Csv => format_delimited(value, b','),
+        Format::Tsv => format_delimited(value, b'\t'),
     }
 }
 
@@ -29,6 +33,87 @@ fn format_json(value: &Value, compact: bool) -> Result<String, QfError> {
 
 fn format_yaml(value: &Value) -> Result<String, QfError> {
     serde_yaml::to_string(value).map_err(|e| QfError::Parse(e.to_string()))
+}
+
+fn format_xml(value: &Value) -> Result<String, QfError> {
+    quick_xml::se::to_string(value).map_err(|e| QfError::Parse(e.to_string()))
+}
+
+fn format_toml(value: &Value) -> Result<String, QfError> {
+    let toml_val = json_to_toml(value)?;
+    toml::to_string_pretty(&toml_val).map_err(|e| QfError::Parse(e.to_string()))
+}
+
+fn json_to_toml(value: &Value) -> Result<toml::Value, QfError> {
+    match value {
+        Value::Null => Ok(toml::Value::String("null".to_string())),
+        Value::Bool(b) => Ok(toml::Value::Boolean(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(toml::Value::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(toml::Value::Float(f))
+            } else {
+                Err(QfError::Parse(format!("unsupported number: {n}")))
+            }
+        }
+        Value::String(s) => Ok(toml::Value::String(s.clone())),
+        Value::Array(arr) => {
+            let items: Result<Vec<_>, _> = arr.iter().map(json_to_toml).collect();
+            Ok(toml::Value::Array(items?))
+        }
+        Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (k, v) in map {
+                table.insert(k.clone(), json_to_toml(v)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
+}
+
+fn format_delimited(value: &Value, delimiter: u8) -> Result<String, QfError> {
+    let rows = match value {
+        Value::Array(arr) => arr,
+        _ => return Err(QfError::Parse("CSV/TSV output requires an array of objects".to_string())),
+    };
+
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    let headers: Vec<String> = match &rows[0] {
+        Value::Object(map) => map.keys().cloned().collect(),
+        _ => return Err(QfError::Parse("CSV/TSV output requires an array of objects".to_string())),
+    };
+
+    let mut wtr = csv::WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_writer(vec![]);
+
+    wtr.write_record(&headers)
+        .map_err(|e| QfError::Parse(e.to_string()))?;
+
+    for row in rows {
+        let obj = row.as_object().ok_or_else(|| {
+            QfError::Parse("CSV/TSV output requires an array of objects".to_string())
+        })?;
+        let fields: Vec<String> = headers
+            .iter()
+            .map(|h| match obj.get(h) {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Null) | None => String::new(),
+                Some(v) => v.to_string(),
+            })
+            .collect();
+        wtr.write_record(&fields)
+            .map_err(|e| QfError::Parse(e.to_string()))?;
+    }
+
+    let bytes = wtr
+        .into_inner()
+        .map_err(|e| QfError::Parse(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|e| QfError::Parse(e.to_string()))
 }
 
 #[cfg(test)]

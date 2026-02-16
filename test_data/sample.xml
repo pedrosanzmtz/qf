@@ -1,0 +1,11 @@
+<configuration>
+  <database>
+    <host>localhost</host>
+    <port>5432</port>
+    <name>mydb</name>
+  </database>
+  <server>
+    <host>0.0.0.0</host>
+    <port>8080</port>
+  </server>
+</configuration>
