@@ -4,11 +4,38 @@ use crate::error::QfError;
 use crate::format::Format;
 
 /// Format a Value as a string in the given format.
-pub fn format_value(value: &Value, format: Format, compact: bool, raw: bool) -> Result<String, QfError> {
+pub fn format_value(
+    value: &Value,
+    format: Format,
+    compact: bool,
+    raw: bool,
+) -> Result<String, QfError> {
+    format_value_colored(value, format, compact, raw, false)
+}
+
+/// Format a Value as a string in the given format, with optional colorization.
+pub fn format_value_colored(
+    value: &Value,
+    format: Format,
+    compact: bool,
+    raw: bool,
+    colorize: bool,
+) -> Result<String, QfError> {
     // Raw mode: if the value is a string, output it without quotes
     if raw {
         if let Value::String(s) = value {
             return Ok(s.clone());
+        }
+    }
+
+    if colorize && !compact {
+        match format {
+            Format::Json => return Ok(super::color::colorize_json(value)),
+            Format::Yaml => {
+                let yaml = format_yaml(value)?;
+                return Ok(super::color::colorize_yaml(&yaml));
+            }
+            _ => {} // fall through to non-colorized for other formats
         }
     }
 

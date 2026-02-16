@@ -100,9 +100,15 @@ impl QueryPath {
         Ok(QueryPath { segments })
     }
 
-    /// Evaluate this path against a JSON Value, returning the matched value(s).
-    pub fn evaluate<'a>(&self, value: &'a Value) -> Result<Value, QfError> {
+    /// Evaluate this path against a JSON Value, returning a single matched value.
+    /// Iterator segments wrap results in an array.
+    pub fn evaluate(&self, value: &Value) -> Result<Value, QfError> {
         evaluate_segments(&self.segments, value)
+    }
+
+    /// Evaluate this path, returning multiple results for iterator segments.
+    pub fn evaluate_multi(&self, value: &Value) -> Result<Vec<Value>, QfError> {
+        evaluate_segments_multi(&self.segments, value)
     }
 }
 
@@ -139,6 +145,45 @@ fn evaluate_segments(segments: &[Segment], value: &Value) -> Result<Value, QfErr
                     .map(|item| evaluate_segments(rest, item))
                     .collect();
                 Ok(Value::Array(results?))
+            }
+            other => Err(QfError::ExpectedArray(value_type_name(other).into())),
+        },
+    }
+}
+
+fn evaluate_segments_multi(segments: &[Segment], value: &Value) -> Result<Vec<Value>, QfError> {
+    if segments.is_empty() {
+        return Ok(vec![value.clone()]);
+    }
+
+    let segment = &segments[0];
+    let rest = &segments[1..];
+
+    match segment {
+        Segment::Key(key) => match value {
+            Value::Object(map) => match map.get(key) {
+                Some(v) => evaluate_segments_multi(rest, v),
+                None => Err(QfError::PathNotFound(format!(".{key}"))),
+            },
+            other => Err(QfError::ExpectedObject(value_type_name(other).into())),
+        },
+        Segment::Index(idx) => match value {
+            Value::Array(arr) => match arr.get(*idx) {
+                Some(v) => evaluate_segments_multi(rest, v),
+                None => Err(QfError::IndexOutOfBounds {
+                    index: *idx,
+                    length: arr.len(),
+                }),
+            },
+            other => Err(QfError::ExpectedArray(value_type_name(other).into())),
+        },
+        Segment::Iterator => match value {
+            Value::Array(arr) => {
+                let mut results = Vec::new();
+                for item in arr {
+                    results.extend(evaluate_segments_multi(rest, item)?);
+                }
+                Ok(results)
             }
             other => Err(QfError::ExpectedArray(value_type_name(other).into())),
         },
