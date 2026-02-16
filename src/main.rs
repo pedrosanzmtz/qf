@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -20,13 +21,17 @@ struct Cli {
     /// Input file (reads from stdin if omitted)
     file: Option<PathBuf>,
 
-    /// Force input format [yaml, json]
+    /// Force input format [yaml, json, xml, toml, csv, tsv]
     #[arg(short = 'p', long = "input-format")]
     input_format: Option<String>,
 
-    /// Output format [yaml, json] (default: same as input)
+    /// Output format [yaml, json, xml, toml, csv, tsv] (default: same as input)
     #[arg(short, long = "output-format")]
     output_format: Option<String>,
+
+    /// Edit file in place
+    #[arg(short, long = "in-place")]
+    in_place: bool,
 
     /// Compact output (no pretty printing)
     #[arg(short, long)]
@@ -39,6 +44,11 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Validate: -i requires a file argument
+    if cli.in_place && cli.file.is_none() {
+        anyhow::bail!("--in-place requires a file argument");
+    }
 
     // Read input
     let input = match &cli.file {
@@ -76,12 +86,25 @@ fn main() -> Result<()> {
     let result = query::query(&value, &cli.query)?;
 
     // Output
-    let formatted = output::format_value(&result, out_fmt, cli.compact, cli.raw)?;
-    print!("{formatted}");
+    let mut formatted = output::format_value(&result, out_fmt, cli.compact, cli.raw)?;
 
-    // Ensure trailing newline for non-raw JSON output
+    // Ensure trailing newline
     if !formatted.ends_with('\n') {
-        println!();
+        formatted.push('\n');
+    }
+
+    if cli.in_place {
+        // Atomic write: write to temp file then rename
+        let path = cli.file.as_ref().unwrap();
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .context("creating temporary file")?;
+        tmp.write_all(formatted.as_bytes())
+            .context("writing temporary file")?;
+        tmp.persist(path)
+            .context("replacing file with updated content")?;
+    } else {
+        print!("{formatted}");
     }
 
     Ok(())
@@ -92,6 +115,8 @@ fn detect_format(input: &str) -> Result<Format, QfError> {
     let trimmed = input.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         Ok(Format::Json)
+    } else if trimmed.starts_with('<') {
+        Ok(Format::Xml)
     } else {
         // Default to YAML — it's a superset of many plain text formats
         Ok(Format::Yaml)

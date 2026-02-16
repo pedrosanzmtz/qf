@@ -1,0 +1,16 @@
+[package]
+name = "qf"
+version = "0.1.0"
+description = "A fast, universal data format query tool"
+
+[package.metadata]
+category = "tools"
+keywords = ["cli", "query", "data"]
+
+[[dependencies]]
+name = "serde"
+version = "1.0"
+
+[[dependencies]]
+name = "clap"
+version = "4.4"

@@ -1,4 +1,8 @@
+pub mod csv;
 pub mod json;
+pub mod toml;
+pub mod tsv;
+pub mod xml;
 pub mod yaml;
 
 use serde_json::Value;
@@ -11,6 +15,10 @@ pub fn parse(input: &str, format: Format) -> Result<Value, QfError> {
     match format {
         Format::Yaml => yaml::parse(input),
         Format::Json => json::parse(input),
+        Format::Xml => xml::parse(input),
+        Format::Toml => toml::parse(input),
+        Format::Csv => csv::parse(input),
+        Format::Tsv => tsv::parse(input),
     }
 }
 
