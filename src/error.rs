@@ -29,6 +29,24 @@ pub enum QfError {
     #[error("expected object but found {0}")]
     ExpectedObject(String),
 
+    #[error("syntax error at position {position}: {message}")]
+    SyntaxError { position: usize, message: String },
+
+    #[error("type error: {0}")]
+    TypeError(String),
+
+    #[error("undefined variable: ${0}")]
+    UndefinedVariable(String),
+
+    #[error("undefined function: {0}/{1}")]
+    UndefinedFunction(String, usize),
+
+    #[error("runtime error: {0}")]
+    Runtime(String),
+
+    #[error("{0}")]
+    UserError(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
