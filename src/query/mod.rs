@@ -4,16 +4,12 @@ pub mod env;
 pub mod eval;
 pub mod jq_parser;
 pub mod lexer;
-pub mod path;
 
 use serde_json::Value;
 
 use crate::error::QfError;
 
-/// Execute a query string against a JSON Value, returning multiple results.
-///
-/// Uses the JQ-compatible engine for complex queries, falls back to
-/// the simple path engine for basic dot-notation paths.
+/// Execute a JQ-compatible query string against a JSON Value, returning all output values.
 pub fn query(input: &Value, query_str: &str) -> Result<Vec<Value>, QfError> {
     // Use the JQ engine for all queries
     let mut lex = lexer::Lexer::new(query_str);
