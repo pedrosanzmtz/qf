@@ -63,7 +63,7 @@ fn format_yaml(value: &Value) -> Result<String, QfError> {
 }
 
 fn format_xml(value: &Value) -> Result<String, QfError> {
-    quick_xml::se::to_string(value).map_err(|e| QfError::Parse(e.to_string()))
+    crate::parser::xml::to_xml(value)
 }
 
 fn format_toml(value: &Value) -> Result<String, QfError> {
