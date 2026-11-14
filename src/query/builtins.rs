@@ -6,7 +6,10 @@ use crate::error::QfError;
 
 use super::ast::Expr;
 use super::env::Env;
-use super::eval::{eval, eval_one, is_truthy, value_type};
+use super::eval::{
+    collect_paths, delete_path_segments, eval_inner, eval_stream, is_truthy,
+    path_segments_to_value, sort_paths_for_deletion, value_type, EvalError, PathSegment,
+};
 
 pub fn call_builtin(
     name: &str,
@@ -14,6 +17,185 @@ pub fn call_builtin(
     input: &Value,
     env: &Env,
 ) -> Result<Vec<Value>, QfError> {
+    let mut results = Vec::new();
+    call_builtin_stream(name, args, input, env, &mut |v| {
+        results.push(v);
+        Ok(true)
+    })
+    .map_err(EvalError::into_qf_error)?;
+    Ok(results)
+}
+
+pub(crate) fn call_builtin_stream(
+    name: &str,
+    args: &[Expr],
+    input: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    match (name, args.len()) {
+        ("select", 1) => eval_stream(&args[0], input, env, &mut |cond| {
+            if is_truthy(&cond) {
+                emit(input.clone())
+            } else {
+                Ok(true)
+            }
+        }),
+        ("range", 1) => eval_stream(&args[0], input, env, &mut |n| {
+            let end = n.as_f64().unwrap_or(0.0) as i64;
+            for i in 0..end {
+                if !emit(Value::Number(i.into()))? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }),
+        ("range", 2) => eval_stream(&args[0], input, env, &mut |s| {
+            let start = s.as_f64().unwrap_or(0.0) as i64;
+            eval_stream(&args[1], input, env, &mut |e| {
+                let end = e.as_f64().unwrap_or(0.0) as i64;
+                for i in start..end {
+                    if !emit(Value::Number(i.into()))? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })
+        }),
+        ("range", 3) => eval_stream(&args[0], input, env, &mut |s| {
+            let start = s.as_f64().unwrap_or(0.0);
+            eval_stream(&args[1], input, env, &mut |e| {
+                let end = e.as_f64().unwrap_or(0.0);
+                eval_stream(&args[2], input, env, &mut |st| {
+                    let step = st.as_f64().unwrap_or(1.0);
+                    if step == 0.0 {
+                        return Err(EvalError::Qf(QfError::Runtime(
+                            "range step cannot be 0".into(),
+                        )));
+                    }
+                    let mut i = start;
+                    if step > 0.0 {
+                        while i < end {
+                            if !emit(json_f64(i))? {
+                                return Ok(false);
+                            }
+                            i += step;
+                        }
+                    } else {
+                        while i > end {
+                            if !emit(json_f64(i))? {
+                                return Ok(false);
+                            }
+                            i += step;
+                        }
+                    }
+                    Ok(true)
+                })
+            })
+        }),
+        ("first", 1) => {
+            let mut outer_cont = true;
+            eval_stream(&args[0], input, env, &mut |v| {
+                outer_cont = emit(v)?;
+                Ok(false)
+            })?;
+            Ok(outer_cont)
+        }
+        ("last", 1) => {
+            let mut last = None;
+            eval_stream(&args[0], input, env, &mut |v| {
+                last = Some(v);
+                Ok(true)
+            })?;
+            if let Some(v) = last {
+                emit(v)
+            } else {
+                Ok(true)
+            }
+        }
+        ("limit", 2) => eval_stream(&args[0], input, env, &mut |n_val| {
+            let count = n_val.as_i64().unwrap_or(0);
+            if count < 0 {
+                return Err(EvalError::Qf(QfError::Runtime(
+                    "limit: count must be non-negative".into(),
+                )));
+            }
+            let mut remaining = count as usize;
+            if remaining == 0 {
+                return Ok(true);
+            }
+            let mut outer_cont = true;
+            eval_stream(&args[1], input, env, &mut |v| {
+                if remaining > 0 {
+                    remaining -= 1;
+                    outer_cont = emit(v)?;
+                    Ok(outer_cont && remaining > 0)
+                } else {
+                    Ok(false)
+                }
+            })?;
+            Ok(outer_cont)
+        }),
+        ("recurse", 0) => eval_stream(&Expr::RecurseAll, input, env, emit),
+        ("recurse", 1) => eval_recurse_stream(&args[0], input, env, emit),
+        ("while", 2) => eval_while_stream(&args[0], &args[1], input, env, emit),
+        ("repeat", 1) => eval_recurse_stream(&args[0], input, env, emit),
+        _ => {
+            let vals = call_builtin_vec(name, args, input, env)?;
+            for v in vals {
+                if !emit(v)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn eval_recurse_stream(
+    f: &Expr,
+    val: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    if !emit(val.clone())? {
+        return Ok(false);
+    }
+    eval_stream(f, val, env, &mut |next| {
+        eval_recurse_stream(f, &next, env, emit)
+    })
+}
+
+fn eval_while_stream(
+    cond: &Expr,
+    update: &Expr,
+    val: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    let cond_vals = eval_inner(cond, val, env)?;
+    for cv in cond_vals {
+        if is_truthy(&cv) {
+            if !emit(val.clone())? {
+                return Ok(false);
+            }
+            let next_vals = eval_inner(update, val, env)?;
+            for nv in next_vals {
+                if !eval_while_stream(cond, update, &nv, env, emit)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn call_builtin_vec(
+    name: &str,
+    args: &[Expr],
+    input: &Value,
+    env: &Env,
+) -> Result<Vec<Value>, EvalError> {
     match (name, args.len()) {
         // ── Type / info ────────────────────────────────────
         ("length", 0) => Ok(vec![length(input)?]),
@@ -25,30 +207,49 @@ pub fn call_builtin(
         ("values", 0) => match input {
             Value::Object(m) => Ok(vec![Value::Array(m.values().cloned().collect())]),
             Value::Array(_) => Ok(vec![input.clone()]),
-            _ => Err(QfError::TypeError(format!(
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
                 "{} is not iterable",
                 value_type(input)
-            ))),
+            )))),
         },
         ("has", 1) => {
-            let key = eval_one(&args[0], input, env)?;
-            match (input, &key) {
-                (Value::Object(m), Value::String(k)) => Ok(vec![Value::Bool(m.contains_key(k))]),
-                (Value::Array(a), Value::Number(n)) => {
-                    let i = n.as_i64().unwrap_or(-1);
-                    Ok(vec![Value::Bool(i >= 0 && (i as usize) < a.len())])
+            let keys = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for key in keys {
+                match (input, &key) {
+                    (Value::Object(m), Value::String(k)) => {
+                        results.push(Value::Bool(m.contains_key(k)))
+                    }
+                    (Value::Array(a), Value::Number(n)) => {
+                        let i = n.as_i64().unwrap_or(-1);
+                        results.push(Value::Bool(i >= 0 && (i as usize) < a.len()));
+                    }
+                    (Value::Null, _) => results.push(Value::Bool(false)),
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "has() requires object/string or array/number".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError(format!(
-                    "has() requires object/string or array/number"
-                ))),
             }
+            Ok(results)
         }
         ("in", 1) => {
-            let container = eval_one(&args[0], input, env)?;
-            match (&container, input) {
-                (Value::Object(m), Value::String(k)) => Ok(vec![Value::Bool(m.contains_key(k))]),
-                _ => Ok(vec![Value::Bool(false)]),
+            let containers = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for container in containers {
+                match (&container, input) {
+                    (Value::Object(m), Value::String(k)) => {
+                        results.push(Value::Bool(m.contains_key(k)))
+                    }
+                    (Value::Array(a), Value::Number(n)) => {
+                        let i = n.as_i64().unwrap_or(-1);
+                        results.push(Value::Bool(i >= 0 && (i as usize) < a.len()));
+                    }
+                    _ => results.push(Value::Bool(false)),
+                }
             }
+            Ok(results)
         }
         ("type", 0) => Ok(vec![Value::String(value_type(input).to_string())]),
         ("infinite", 0) => Ok(vec![json_f64(f64::INFINITY)]),
@@ -60,15 +261,11 @@ pub fn call_builtin(
             _ => Ok(vec![Value::Bool(false)]),
         },
         ("isnan", 0) => match input {
-            Value::Number(n) => Ok(vec![Value::Bool(
-                n.as_f64().is_some_and(|f| f.is_nan()),
-            )]),
+            Value::Number(n) => Ok(vec![Value::Bool(n.as_f64().is_some_and(|f| f.is_nan()))]),
             _ => Ok(vec![Value::Bool(false)]),
         },
         ("isnormal", 0) => match input {
-            Value::Number(n) => Ok(vec![Value::Bool(
-                n.as_f64().is_some_and(|f| f.is_normal()),
-            )]),
+            Value::Number(n) => Ok(vec![Value::Bool(n.as_f64().is_some_and(|f| f.is_normal()))]),
             _ => Ok(vec![Value::Bool(false)]),
         },
         ("builtins", 0) => {
@@ -79,24 +276,14 @@ pub fn call_builtin(
         }
 
         // ── Selection / filtering ──────────────────────────
-        ("select", 1) => {
-            let cond = eval_one(&args[0], input, env)?;
-            if is_truthy(&cond) {
-                Ok(vec![input.clone()])
+        ("empty", 0) => Ok(vec![]),
+        ("error", 0) => Err(EvalError::UserValue(input.clone())),
+        ("error", 1) => {
+            let msgs = eval_inner(&args[0], input, env)?;
+            if let Some(msg) = msgs.into_iter().next() {
+                Err(EvalError::UserValue(msg))
             } else {
                 Ok(vec![])
-            }
-        }
-        ("empty", 0) => Ok(vec![]),
-        ("error", 0) => match input {
-            Value::String(s) => Err(QfError::UserError(s.clone())),
-            _ => Err(QfError::UserError(input.to_string())),
-        },
-        ("error", 1) => {
-            let msg = eval_one(&args[0], input, env)?;
-            match msg {
-                Value::String(s) => Err(QfError::UserError(s)),
-                v => Err(QfError::UserError(v.to_string())),
             }
         }
         ("debug", 0) => {
@@ -104,8 +291,10 @@ pub fn call_builtin(
             Ok(vec![input.clone()])
         }
         ("debug", 1) => {
-            let msg = eval_one(&args[0], input, env)?;
-            eprintln!("[\"DEBUG:\",{},{}]", msg, input);
+            let msgs = eval_inner(&args[0], input, env)?;
+            for msg in msgs {
+                eprintln!("[\"DEBUG:\",{},{}]", msg, input);
+            }
             Ok(vec![input.clone()])
         }
 
@@ -114,30 +303,35 @@ pub fn call_builtin(
             Value::Array(arr) => {
                 let mut results = Vec::new();
                 for item in arr {
-                    results.extend(eval(&args[0], item, env)?);
+                    results.extend(eval_inner(&args[0], item, env)?);
                 }
                 Ok(vec![Value::Array(results)])
             }
-            _ => Err(QfError::TypeError(format!("map requires array, got {}", value_type(input)))),
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
+                "map requires array, got {}",
+                value_type(input)
+            )))),
         },
         ("map_values", 1) => match input {
             Value::Object(map) => {
                 let mut result = serde_json::Map::new();
                 for (k, v) in map {
-                    let new_v = eval_one(&args[0], v, env)?;
-                    result.insert(k.clone(), new_v);
+                    let vals = eval_inner(&args[0], v, env)?;
+                    if let Some(new_v) = vals.into_iter().next() {
+                        result.insert(k.clone(), new_v);
+                    }
                 }
                 Ok(vec![Value::Object(result)])
             }
             Value::Array(arr) => {
                 let mut results = Vec::new();
                 for item in arr {
-                    results.push(eval_one(&args[0], item, env)?);
+                    results.extend(eval_inner(&args[0], item, env)?);
                 }
                 Ok(vec![Value::Array(results)])
             }
-            _ => Err(QfError::TypeError(format!(
-                "map_values requires object or array"
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "map_values requires object or array".into(),
             ))),
         },
         ("to_entries", 0) => match input {
@@ -153,7 +347,9 @@ pub fn call_builtin(
                     .collect();
                 Ok(vec![Value::Array(entries)])
             }
-            _ => Err(QfError::TypeError("to_entries requires object".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "to_entries requires object".into(),
+            ))),
         },
         ("from_entries", 0) => match input {
             Value::Array(arr) => {
@@ -168,38 +364,49 @@ pub fn call_builtin(
                             _ => None,
                         })
                         .unwrap_or_default();
-                    let val = item
-                        .get("value")
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    let val = item.get("value").cloned().unwrap_or(Value::Null);
                     map.insert(key, val);
                 }
                 Ok(vec![Value::Object(map)])
             }
-            _ => Err(QfError::TypeError("from_entries requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "from_entries requires array".into(),
+            ))),
         },
         ("with_entries", 1) => {
             // Equivalent to: to_entries | map(f) | from_entries
-            let entries = call_builtin("to_entries", &[], input, env)?;
-            let mapped = call_builtin("map", args, &entries[0], env)?;
-            call_builtin("from_entries", &[], &mapped[0], env)
+            let entries = call_builtin_vec("to_entries", &[], input, env)?;
+            let mapped = call_builtin_vec("map", args, &entries[0], env)?;
+            call_builtin_vec("from_entries", &[], &mapped[0], env)
         }
         ("transpose", 0) => match input {
             Value::Array(arr) => {
                 if arr.is_empty() {
                     return Ok(vec![Value::Array(vec![])]);
                 }
-                let max_len = arr.iter().filter_map(|v| v.as_array()).map(|a| a.len()).max().unwrap_or(0);
+                let max_len = arr
+                    .iter()
+                    .filter_map(|v| v.as_array())
+                    .map(|a| a.len())
+                    .max()
+                    .unwrap_or(0);
                 let mut result = Vec::new();
                 for i in 0..max_len {
-                    let row: Vec<Value> = arr.iter().map(|v| {
-                        v.as_array().and_then(|a| a.get(i).cloned()).unwrap_or(Value::Null)
-                    }).collect();
+                    let row: Vec<Value> = arr
+                        .iter()
+                        .map(|v| {
+                            v.as_array()
+                                .and_then(|a| a.get(i).cloned())
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect();
                     result.push(Value::Array(row));
                 }
                 Ok(vec![Value::Array(result)])
             }
-            _ => Err(QfError::TypeError("transpose requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "transpose requires array".into(),
+            ))),
         },
 
         // ── Aggregation ────────────────────────────────────
@@ -210,7 +417,7 @@ pub fn call_builtin(
                 }
                 let mut acc = arr[0].clone();
                 for item in &arr[1..] {
-                    acc = super::eval::eval_one(
+                    let vals = eval_inner(
                         &Expr::BinOp(
                             super::ast::BinOp::Add,
                             Box::new(Expr::Identity),
@@ -219,122 +426,99 @@ pub fn call_builtin(
                         &acc,
                         env,
                     )?;
+                    acc = vals.into_iter().next().unwrap_or(Value::Null);
                 }
                 Ok(vec![acc])
             }
-            _ => Err(QfError::TypeError("add requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "add requires array".into(),
+            ))),
         },
         ("any", 0) => match input {
             Value::Array(arr) => Ok(vec![Value::Bool(arr.iter().any(is_truthy))]),
-            _ => Err(QfError::TypeError("any requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "any requires array".into(),
+            ))),
         },
         ("any", 1) => match input {
             Value::Array(arr) => {
                 for item in arr {
-                    let v = eval_one(&args[0], item, env)?;
-                    if is_truthy(&v) {
+                    let vals = eval_inner(&args[0], item, env)?;
+                    if vals.iter().any(is_truthy) {
                         return Ok(vec![Value::Bool(true)]);
                     }
                 }
                 Ok(vec![Value::Bool(false)])
             }
-            _ => Err(QfError::TypeError("any requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "any requires array".into(),
+            ))),
         },
         ("all", 0) => match input {
             Value::Array(arr) => Ok(vec![Value::Bool(arr.iter().all(is_truthy))]),
-            _ => Err(QfError::TypeError("all requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "all requires array".into(),
+            ))),
         },
         ("all", 1) => match input {
             Value::Array(arr) => {
                 for item in arr {
-                    let v = eval_one(&args[0], item, env)?;
-                    if !is_truthy(&v) {
+                    let vals = eval_inner(&args[0], item, env)?;
+                    if vals.iter().any(|v| !is_truthy(v)) {
                         return Ok(vec![Value::Bool(false)]);
                     }
                 }
                 Ok(vec![Value::Bool(true)])
             }
-            _ => Err(QfError::TypeError("all requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "all requires array".into(),
+            ))),
         },
-        ("flatten", 0) => flatten(input, usize::MAX),
+        ("flatten", 0) => Ok(flatten(input, usize::MAX)?),
         ("flatten", 1) => {
-            let depth = eval_one(&args[0], input, env)?;
-            let d = depth.as_u64().unwrap_or(1) as usize;
-            flatten(input, d)
-        },
-        ("range", 1) => {
-            let n = eval_one(&args[0], input, env)?;
-            let end = n.as_f64().unwrap_or(0.0) as i64;
+            let depths = eval_inner(&args[0], input, env)?;
             let mut results = Vec::new();
-            for i in 0..end {
-                results.push(Value::Number(i.into()));
+            for depth in depths {
+                let d = depth.as_u64().unwrap_or(1) as usize;
+                results.extend(flatten(input, d)?);
             }
             Ok(results)
-        },
-        ("range", 2) => {
-            let start = eval_one(&args[0], input, env)?.as_f64().unwrap_or(0.0) as i64;
-            let end = eval_one(&args[1], input, env)?.as_f64().unwrap_or(0.0) as i64;
-            let mut results = Vec::new();
-            for i in start..end {
-                results.push(Value::Number(i.into()));
-            }
-            Ok(results)
-        },
-        ("range", 3) => {
-            let start = eval_one(&args[0], input, env)?.as_f64().unwrap_or(0.0);
-            let end = eval_one(&args[1], input, env)?.as_f64().unwrap_or(0.0);
-            let step = eval_one(&args[2], input, env)?.as_f64().unwrap_or(1.0);
-            if step == 0.0 { return Err(QfError::Runtime("range step cannot be 0".into())); }
-            let mut results = Vec::new();
-            let mut i = start;
-            if step > 0.0 {
-                while i < end {
-                    results.push(json_f64(i));
-                    i += step;
-                }
-            } else {
-                while i > end {
-                    results.push(json_f64(i));
-                    i += step;
-                }
-            }
-            Ok(results)
-        },
+        }
 
         // ── Sorting ────────────────────────────────────────
         ("sort", 0) => match input {
             Value::Array(arr) => {
                 let mut sorted = arr.clone();
-                sorted.sort_by(|a, b| compare_values(a, b));
+                sorted.sort_by(compare_values);
                 Ok(vec![Value::Array(sorted)])
             }
-            _ => Err(QfError::TypeError("sort requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "sort requires array".into(),
+            ))),
         },
         ("sort_by", 1) => match input {
             Value::Array(arr) => {
-                let mut indexed: Vec<(Value, Value)> = arr
-                    .iter()
-                    .map(|item| {
-                        let key = eval_one(&args[0], item, env).unwrap_or(Value::Null);
-                        (key, item.clone())
-                    })
-                    .collect();
+                let mut indexed: Vec<(Value, Value)> = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let keys = eval_inner(&args[0], item, env)?;
+                    indexed.push((Value::Array(keys), item.clone()));
+                }
                 indexed.sort_by(|a, b| compare_values(&a.0, &b.0));
                 Ok(vec![Value::Array(
                     indexed.into_iter().map(|(_, v)| v).collect(),
                 )])
             }
-            _ => Err(QfError::TypeError("sort_by requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "sort_by requires array".into(),
+            ))),
         },
         ("group_by", 1) => match input {
             Value::Array(arr) => {
-                let mut keyed: Vec<(Value, Value)> = arr
-                    .iter()
-                    .map(|item| {
-                        let key = eval_one(&args[0], item, env).unwrap_or(Value::Null);
-                        (key, item.clone())
-                    })
-                    .collect();
+                let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let keys = eval_inner(&args[0], item, env)?;
+                    keyed.push((Value::Array(keys), item.clone()));
+                }
                 keyed.sort_by(|a, b| compare_values(&a.0, &b.0));
 
                 let mut groups: Vec<Value> = Vec::new();
@@ -357,23 +541,28 @@ pub fn call_builtin(
                 }
                 Ok(vec![Value::Array(groups)])
             }
-            _ => Err(QfError::TypeError("group_by requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "group_by requires array".into(),
+            ))),
         },
         ("unique", 0) => match input {
             Value::Array(arr) => {
                 let mut sorted = arr.clone();
-                sorted.sort_by(|a, b| compare_values(a, b));
+                sorted.sort_by(compare_values);
                 sorted.dedup();
                 Ok(vec![Value::Array(sorted)])
             }
-            _ => Err(QfError::TypeError("unique requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "unique requires array".into(),
+            ))),
         },
         ("unique_by", 1) => match input {
             Value::Array(arr) => {
                 let mut seen = Vec::new();
                 let mut result = Vec::new();
                 for item in arr {
-                    let key = eval_one(&args[0], item, env)?;
+                    let keys = eval_inner(&args[0], item, env)?;
+                    let key = Value::Array(keys);
                     if !seen.contains(&key) {
                         seen.push(key);
                         result.push(item.clone());
@@ -381,7 +570,9 @@ pub fn call_builtin(
                 }
                 Ok(vec![Value::Array(result)])
             }
-            _ => Err(QfError::TypeError("unique_by requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "unique_by requires array".into(),
+            ))),
         },
         ("reverse", 0) => match input {
             Value::Array(arr) => {
@@ -390,125 +581,143 @@ pub fn call_builtin(
                 Ok(vec![Value::Array(rev)])
             }
             Value::String(s) => Ok(vec![Value::String(s.chars().rev().collect())]),
-            _ => Err(QfError::TypeError("reverse requires array or string".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "reverse requires array or string".into(),
+            ))),
         },
         ("min", 0) => match input {
             Value::Array(arr) if !arr.is_empty() => {
-                let m = arr
-                    .iter()
-                    .min_by(|a, b| compare_values(a, b))
-                    .unwrap();
+                let m = arr.iter().min_by(|a, b| compare_values(a, b)).unwrap();
                 Ok(vec![m.clone()])
             }
             Value::Array(_) => Ok(vec![Value::Null]),
-            _ => Err(QfError::TypeError("min requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "min requires array".into(),
+            ))),
         },
         ("max", 0) => match input {
             Value::Array(arr) if !arr.is_empty() => {
-                let m = arr
-                    .iter()
-                    .max_by(|a, b| compare_values(a, b))
-                    .unwrap();
+                let m = arr.iter().max_by(|a, b| compare_values(a, b)).unwrap();
                 Ok(vec![m.clone()])
             }
             Value::Array(_) => Ok(vec![Value::Null]),
-            _ => Err(QfError::TypeError("max requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "max requires array".into(),
+            ))),
         },
         ("min_by", 1) => match input {
             Value::Array(arr) if !arr.is_empty() => {
-                let m = arr
-                    .iter()
-                    .min_by(|a, b| {
-                        let ka = eval_one(&args[0], a, env).unwrap_or(Value::Null);
-                        let kb = eval_one(&args[0], b, env).unwrap_or(Value::Null);
-                        compare_values(&ka, &kb)
-                    })
+                let mut keyed: Vec<(Value, &Value)> = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let keys = eval_inner(&args[0], item, env)?;
+                    keyed.push((Value::Array(keys), item));
+                }
+                let (_, m) = keyed
+                    .into_iter()
+                    .min_by(|a, b| compare_values(&a.0, &b.0))
                     .unwrap();
                 Ok(vec![m.clone()])
             }
             Value::Array(_) => Ok(vec![Value::Null]),
-            _ => Err(QfError::TypeError("min_by requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "min_by requires array".into(),
+            ))),
         },
         ("max_by", 1) => match input {
             Value::Array(arr) if !arr.is_empty() => {
-                let m = arr
-                    .iter()
-                    .max_by(|a, b| {
-                        let ka = eval_one(&args[0], a, env).unwrap_or(Value::Null);
-                        let kb = eval_one(&args[0], b, env).unwrap_or(Value::Null);
-                        compare_values(&ka, &kb)
-                    })
+                let mut keyed: Vec<(Value, &Value)> = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let keys = eval_inner(&args[0], item, env)?;
+                    keyed.push((Value::Array(keys), item));
+                }
+                let (_, m) = keyed
+                    .into_iter()
+                    .max_by(|a, b| compare_values(&a.0, &b.0))
                     .unwrap();
                 Ok(vec![m.clone()])
             }
             Value::Array(_) => Ok(vec![Value::Null]),
-            _ => Err(QfError::TypeError("max_by requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "max_by requires array".into(),
+            ))),
         },
 
         // ── Searching / containment ────────────────────────
         ("contains", 1) => {
-            let other = eval_one(&args[0], input, env)?;
-            Ok(vec![Value::Bool(value_contains(input, &other))])
+            let others = eval_inner(&args[0], input, env)?;
+            Ok(others
+                .into_iter()
+                .map(|other| Value::Bool(value_contains(input, &other)))
+                .collect())
         }
         ("inside", 1) => {
-            let other = eval_one(&args[0], input, env)?;
-            Ok(vec![Value::Bool(value_contains(&other, input))])
+            let others = eval_inner(&args[0], input, env)?;
+            Ok(others
+                .into_iter()
+                .map(|other| Value::Bool(value_contains(&other, input)))
+                .collect())
         }
         ("indices" | "index", 1) => {
-            let needle = eval_one(&args[0], input, env)?;
-            match input {
-                Value::Array(arr) => {
-                    let indices: Vec<Value> = arr
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, v)| *v == &needle)
-                        .map(|(i, _)| Value::Number(i.into()))
-                        .collect();
-                    if name == "index" {
-                        Ok(vec![indices.into_iter().next().unwrap_or(Value::Null)])
-                    } else {
-                        Ok(vec![Value::Array(indices)])
-                    }
-                }
-                Value::String(s) => {
-                    if let Value::String(pat) = &needle {
-                        let indices: Vec<Value> = s
-                            .match_indices(pat.as_str())
+            let needles = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for needle in needles {
+                let val = match input {
+                    Value::Array(arr) => {
+                        let indices: Vec<Value> = arr
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| *v == &needle)
                             .map(|(i, _)| Value::Number(i.into()))
                             .collect();
                         if name == "index" {
-                            Ok(vec![indices.into_iter().next().unwrap_or(Value::Null)])
+                            indices.into_iter().next().unwrap_or(Value::Null)
                         } else {
-                            Ok(vec![Value::Array(indices)])
+                            Value::Array(indices)
                         }
-                    } else {
-                        Ok(vec![Value::Null])
                     }
-                }
-                _ => Ok(vec![Value::Null]),
+                    Value::String(s) => {
+                        if let Value::String(pat) = &needle {
+                            let indices: Vec<Value> = s
+                                .match_indices(pat.as_str())
+                                .map(|(i, _)| Value::Number(i.into()))
+                                .collect();
+                            if name == "index" {
+                                indices.into_iter().next().unwrap_or(Value::Null)
+                            } else {
+                                Value::Array(indices)
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                results.push(val);
             }
+            Ok(results)
         }
         ("rindex", 1) => {
-            let needle = eval_one(&args[0], input, env)?;
-            match input {
-                Value::Array(arr) => {
-                    let idx = arr.iter().rposition(|v| v == &needle);
-                    Ok(vec![idx
-                        .map(|i| Value::Number(i.into()))
-                        .unwrap_or(Value::Null)])
-                }
-                Value::String(s) => {
-                    if let Value::String(pat) = &needle {
-                        let idx = s.rfind(pat.as_str());
-                        Ok(vec![idx
-                            .map(|i| Value::Number(i.into()))
-                            .unwrap_or(Value::Null)])
-                    } else {
-                        Ok(vec![Value::Null])
+            let needles = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for needle in needles {
+                let val = match input {
+                    Value::Array(arr) => {
+                        let idx = arr.iter().rposition(|v| v == &needle);
+                        idx.map(|i| Value::Number(i.into())).unwrap_or(Value::Null)
                     }
-                }
-                _ => Ok(vec![Value::Null]),
+                    Value::String(s) => {
+                        if let Value::String(pat) = &needle {
+                            let idx = s.rfind(pat.as_str());
+                            idx.map(|i| Value::Number(i.into())).unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                results.push(val);
             }
+            Ok(results)
         }
 
         // ── Type conversion ────────────────────────────────
@@ -517,7 +726,9 @@ pub fn call_builtin(
             Value::Null => Ok(vec![Value::String("null".into())]),
             Value::Bool(b) => Ok(vec![Value::String(b.to_string())]),
             Value::Number(n) => Ok(vec![Value::String(n.to_string())]),
-            _ => Ok(vec![Value::String(serde_json::to_string(input).unwrap_or_default())]),
+            _ => Ok(vec![Value::String(
+                serde_json::to_string(input).unwrap_or_default(),
+            )]),
         },
         ("tonumber", 0) => match input {
             Value::Number(_) => Ok(vec![input.clone()]),
@@ -527,99 +738,141 @@ pub fn call_builtin(
                     .map_err(|_| QfError::TypeError(format!("cannot convert \"{s}\" to number")))?;
                 Ok(vec![json_f64(n)])
             }
-            _ => Err(QfError::TypeError(format!(
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
                 "cannot convert {} to number",
                 value_type(input)
-            ))),
+            )))),
         },
         ("ascii_downcase", 0) => match input {
             Value::String(s) => Ok(vec![Value::String(s.to_ascii_lowercase())]),
-            _ => Err(QfError::TypeError("ascii_downcase requires string".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "ascii_downcase requires string".into(),
+            ))),
         },
         ("ascii_upcase", 0) => match input {
             Value::String(s) => Ok(vec![Value::String(s.to_ascii_uppercase())]),
-            _ => Err(QfError::TypeError("ascii_upcase requires string".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "ascii_upcase requires string".into(),
+            ))),
         },
         ("ltrimstr", 1) => {
-            let prefix = eval_one(&args[0], input, env)?;
-            match (input, &prefix) {
-                (Value::String(s), Value::String(p)) => Ok(vec![Value::String(
-                    s.strip_prefix(p.as_str())
-                        .unwrap_or(s)
-                        .to_string(),
-                )]),
-                _ => Ok(vec![input.clone()]),
+            let prefixes = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for prefix in prefixes {
+                match (input, &prefix) {
+                    (Value::String(s), Value::String(p)) => results.push(Value::String(
+                        s.strip_prefix(p.as_str()).unwrap_or(s).to_string(),
+                    )),
+                    _ => results.push(input.clone()),
+                }
             }
+            Ok(results)
         }
         ("rtrimstr", 1) => {
-            let suffix = eval_one(&args[0], input, env)?;
-            match (input, &suffix) {
-                (Value::String(s), Value::String(p)) => Ok(vec![Value::String(
-                    s.strip_suffix(p.as_str())
-                        .unwrap_or(s)
-                        .to_string(),
-                )]),
-                _ => Ok(vec![input.clone()]),
+            let suffixes = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for suffix in suffixes {
+                match (input, &suffix) {
+                    (Value::String(s), Value::String(p)) => results.push(Value::String(
+                        s.strip_suffix(p.as_str()).unwrap_or(s).to_string(),
+                    )),
+                    _ => results.push(input.clone()),
+                }
             }
+            Ok(results)
         }
         ("trim", 0) => match input {
             Value::String(s) => Ok(vec![Value::String(s.trim().to_string())]),
             _ => Ok(vec![input.clone()]),
         },
         ("split", 1) => {
-            let sep = eval_one(&args[0], input, env)?;
-            match (input, &sep) {
-                (Value::String(s), Value::String(p)) => {
-                    let parts: Vec<Value> = s
-                        .split(p.as_str())
-                        .map(|part| Value::String(part.to_string()))
-                        .collect();
-                    Ok(vec![Value::Array(parts)])
+            let seps = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for sep in seps {
+                match (input, &sep) {
+                    (Value::String(s), Value::String(p)) => {
+                        let parts: Vec<Value> = s
+                            .split(p.as_str())
+                            .map(|part| Value::String(part.to_string()))
+                            .collect();
+                        results.push(Value::Array(parts));
+                    }
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "split requires string args".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError("split requires string args".into())),
             }
+            Ok(results)
         }
         ("join", 1) => {
-            let sep = eval_one(&args[0], input, env)?;
-            match (input, &sep) {
-                (Value::Array(arr), Value::String(s)) => {
-                    let parts: Vec<String> = arr
-                        .iter()
-                        .map(|v| match v {
-                            Value::String(s) => s.clone(),
-                            Value::Null => String::new(),
-                            v => v.to_string(),
-                        })
-                        .collect();
-                    Ok(vec![Value::String(parts.join(s))])
+            let seps = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for sep in seps {
+                match (input, &sep) {
+                    (Value::Array(arr), Value::String(s)) => {
+                        let parts: Vec<String> = arr
+                            .iter()
+                            .map(|v| match v {
+                                Value::String(s) => s.clone(),
+                                Value::Null => String::new(),
+                                v => v.to_string(),
+                            })
+                            .collect();
+                        results.push(Value::String(parts.join(s)));
+                    }
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "join requires array and string".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError("join requires array and string".into())),
             }
+            Ok(results)
         }
         ("startswith", 1) => {
-            let prefix = eval_one(&args[0], input, env)?;
-            match (input, &prefix) {
-                (Value::String(s), Value::String(p)) => {
-                    Ok(vec![Value::Bool(s.starts_with(p.as_str()))])
+            let prefixes = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for prefix in prefixes {
+                match (input, &prefix) {
+                    (Value::String(s), Value::String(p)) => {
+                        results.push(Value::Bool(s.starts_with(p.as_str())))
+                    }
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "startswith requires strings".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError("startswith requires strings".into())),
             }
+            Ok(results)
         }
         ("endswith", 1) => {
-            let suffix = eval_one(&args[0], input, env)?;
-            match (input, &suffix) {
-                (Value::String(s), Value::String(p)) => {
-                    Ok(vec![Value::Bool(s.ends_with(p.as_str()))])
+            let suffixes = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for suffix in suffixes {
+                match (input, &suffix) {
+                    (Value::String(s), Value::String(p)) => {
+                        results.push(Value::Bool(s.ends_with(p.as_str())))
+                    }
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "endswith requires strings".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError("endswith requires strings".into())),
             }
+            Ok(results)
         }
         ("ascii", 0) => match input {
             Value::Number(n) => {
                 let c = n.as_u64().unwrap_or(0) as u8 as char;
                 Ok(vec![Value::String(c.to_string())])
             }
-            _ => Err(QfError::TypeError("ascii requires number".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "ascii requires number".into(),
+            ))),
         },
         ("explode", 0) => match input {
             Value::String(s) => Ok(vec![Value::Array(
@@ -627,247 +880,278 @@ pub fn call_builtin(
                     .map(|c| Value::Number((c as u32).into()))
                     .collect(),
             )]),
-            _ => Err(QfError::TypeError("explode requires string".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "explode requires string".into(),
+            ))),
         },
         ("implode", 0) => match input {
             Value::Array(arr) => {
                 let s: String = arr
                     .iter()
-                    .filter_map(|v| {
-                        v.as_u64()
-                            .and_then(|n| char::from_u32(n as u32))
-                    })
+                    .filter_map(|v| v.as_u64().and_then(|n| char::from_u32(n as u32)))
                     .collect();
                 Ok(vec![Value::String(s)])
             }
-            _ => Err(QfError::TypeError("implode requires array".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "implode requires array".into(),
+            ))),
         },
 
         // ── Regex ──────────────────────────────────────────
         ("test", 1) | ("test", 2) => {
-            let pattern = eval_one(&args[0], input, env)?;
-            let flags = if args.len() > 1 {
-                eval_one(&args[1], input, env)?.as_str().unwrap_or("").to_string()
+            let patterns = eval_inner(&args[0], input, env)?;
+            let flags_list = if args.len() > 1 {
+                eval_inner(&args[1], input, env)?
+                    .into_iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
             } else {
-                String::new()
+                vec![String::new()]
             };
-            match (input, &pattern) {
-                (Value::String(s), Value::String(p)) => {
-                    let re = build_regex(p, &flags)?;
-                    Ok(vec![Value::Bool(re.is_match(s))])
+            let mut results = Vec::new();
+            for pattern in &patterns {
+                for flags in &flags_list {
+                    match (input, pattern) {
+                        (Value::String(s), Value::String(p)) => {
+                            let re = build_regex(p, flags)?;
+                            results.push(Value::Bool(re.is_match(s)));
+                        }
+                        _ => {
+                            return Err(EvalError::Qf(QfError::TypeError(
+                                "test requires string input and pattern".into(),
+                            )))
+                        }
+                    }
                 }
-                _ => Err(QfError::TypeError("test requires string input and pattern".into())),
             }
+            Ok(results)
         }
         ("match", 1) | ("match", 2) => {
-            let pattern = eval_one(&args[0], input, env)?;
-            let flags = if args.len() > 1 {
-                eval_one(&args[1], input, env)?.as_str().unwrap_or("").to_string()
+            let patterns = eval_inner(&args[0], input, env)?;
+            let flags_list = if args.len() > 1 {
+                eval_inner(&args[1], input, env)?
+                    .into_iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
             } else {
-                String::new()
+                vec![String::new()]
             };
-            match (input, &pattern) {
-                (Value::String(s), Value::String(p)) => {
-                    let re = build_regex(p, &flags)?;
-                    if let Some(m) = re.find(s) {
-                        let mut result = serde_json::Map::new();
-                        result.insert("offset".into(), Value::Number(m.start().into()));
-                        result.insert("length".into(), Value::Number(m.len().into()));
-                        result.insert("string".into(), Value::String(m.as_str().to_string()));
-                        let captures: Vec<Value> = re
-                            .captures(s)
-                            .map(|caps| {
-                                (1..caps.len())
-                                    .map(|i| {
-                                        let mut cap = serde_json::Map::new();
-                                        if let Some(m) = caps.get(i) {
-                                            cap.insert("offset".into(), Value::Number(m.start().into()));
-                                            cap.insert("length".into(), Value::Number(m.len().into()));
-                                            cap.insert("string".into(), Value::String(m.as_str().to_string()));
-                                            cap.insert("name".into(), Value::Null);
-                                        }
-                                        Value::Object(cap)
+            let mut results = Vec::new();
+            for pattern in &patterns {
+                for flags in &flags_list {
+                    match (input, pattern) {
+                        (Value::String(s), Value::String(p)) => {
+                            let re = build_regex(p, flags)?;
+                            if let Some(m) = re.find(s) {
+                                let mut result = serde_json::Map::new();
+                                result.insert("offset".into(), Value::Number(m.start().into()));
+                                result.insert("length".into(), Value::Number(m.len().into()));
+                                result
+                                    .insert("string".into(), Value::String(m.as_str().to_string()));
+                                let captures: Vec<Value> = re
+                                    .captures(s)
+                                    .map(|caps| {
+                                        (1..caps.len())
+                                            .map(|i| {
+                                                let mut cap = serde_json::Map::new();
+                                                if let Some(m) = caps.get(i) {
+                                                    cap.insert(
+                                                        "offset".into(),
+                                                        Value::Number(m.start().into()),
+                                                    );
+                                                    cap.insert(
+                                                        "length".into(),
+                                                        Value::Number(m.len().into()),
+                                                    );
+                                                    cap.insert(
+                                                        "string".into(),
+                                                        Value::String(m.as_str().to_string()),
+                                                    );
+                                                    cap.insert("name".into(), Value::Null);
+                                                }
+                                                Value::Object(cap)
+                                            })
+                                            .collect()
                                     })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        result.insert("captures".into(), Value::Array(captures));
-                        Ok(vec![Value::Object(result)])
-                    } else {
-                        Ok(vec![Value::Null])
-                    }
-                }
-                _ => Err(QfError::TypeError("match requires string".into())),
-            }
-        }
-        ("capture", 1) | ("capture", 2) => {
-            let pattern = eval_one(&args[0], input, env)?;
-            let flags = if args.len() > 1 {
-                eval_one(&args[1], input, env)?.as_str().unwrap_or("").to_string()
-            } else {
-                String::new()
-            };
-            match (input, &pattern) {
-                (Value::String(s), Value::String(p)) => {
-                    let re = build_regex(p, &flags)?;
-                    if let Some(caps) = re.captures(s) {
-                        let mut result = serde_json::Map::new();
-                        for name in re.capture_names().flatten() {
-                            if let Some(m) = caps.name(name) {
-                                result.insert(
-                                    name.to_string(),
-                                    Value::String(m.as_str().to_string()),
-                                );
+                                    .unwrap_or_default();
+                                result.insert("captures".into(), Value::Array(captures));
+                                results.push(Value::Object(result));
+                            } else {
+                                results.push(Value::Null);
                             }
                         }
-                        Ok(vec![Value::Object(result)])
-                    } else {
-                        Ok(vec![Value::Null])
+                        _ => {
+                            return Err(EvalError::Qf(QfError::TypeError(
+                                "match requires string".into(),
+                            )))
+                        }
                     }
                 }
-                _ => Err(QfError::TypeError("capture requires string".into())),
             }
+            Ok(results)
+        }
+        ("capture", 1) | ("capture", 2) => {
+            let patterns = eval_inner(&args[0], input, env)?;
+            let flags_list = if args.len() > 1 {
+                eval_inner(&args[1], input, env)?
+                    .into_iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
+            } else {
+                vec![String::new()]
+            };
+            let mut results = Vec::new();
+            for pattern in &patterns {
+                for flags in &flags_list {
+                    match (input, pattern) {
+                        (Value::String(s), Value::String(p)) => {
+                            let re = build_regex(p, flags)?;
+                            if let Some(caps) = re.captures(s) {
+                                let mut result = serde_json::Map::new();
+                                for name in re.capture_names().flatten() {
+                                    if let Some(m) = caps.name(name) {
+                                        result.insert(
+                                            name.to_string(),
+                                            Value::String(m.as_str().to_string()),
+                                        );
+                                    }
+                                }
+                                results.push(Value::Object(result));
+                            } else {
+                                results.push(Value::Null);
+                            }
+                        }
+                        _ => {
+                            return Err(EvalError::Qf(QfError::TypeError(
+                                "capture requires string".into(),
+                            )))
+                        }
+                    }
+                }
+            }
+            Ok(results)
         }
         ("scan", 1) => {
-            let pattern = eval_one(&args[0], input, env)?;
-            match (input, &pattern) {
-                (Value::String(s), Value::String(p)) => {
-                    let re = build_regex(p, "")?;
-                    let results: Vec<Value> = re
-                        .find_iter(s)
-                        .map(|m| Value::String(m.as_str().to_string()))
-                        .collect();
-                    Ok(vec![Value::Array(results)])
+            let patterns = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for pattern in &patterns {
+                match (input, pattern) {
+                    (Value::String(s), Value::String(p)) => {
+                        let re = build_regex(p, "")?;
+                        let matches: Vec<Value> = re
+                            .find_iter(s)
+                            .map(|m| Value::String(m.as_str().to_string()))
+                            .collect();
+                        results.push(Value::Array(matches));
+                    }
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "scan requires string".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError("scan requires string".into())),
             }
+            Ok(results)
         }
         ("sub", 2) | ("sub", 3) => {
-            let pattern = eval_one(&args[0], input, env)?;
-            let replacement = eval_one(&args[1], input, env)?;
-            let flags = if args.len() > 2 {
-                eval_one(&args[2], input, env)?.as_str().unwrap_or("").to_string()
+            let patterns = eval_inner(&args[0], input, env)?;
+            let replacements = eval_inner(&args[1], input, env)?;
+            let flags_list = if args.len() > 2 {
+                eval_inner(&args[2], input, env)?
+                    .into_iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
             } else {
-                String::new()
+                vec![String::new()]
             };
-            match (input, &pattern, &replacement) {
-                (Value::String(s), Value::String(p), Value::String(r)) => {
-                    let re = build_regex(p, &flags)?;
-                    Ok(vec![Value::String(re.replace(s, r.as_str()).to_string())])
+            let mut results = Vec::new();
+            for pattern in &patterns {
+                for replacement in &replacements {
+                    for flags in &flags_list {
+                        match (input, pattern, replacement) {
+                            (Value::String(s), Value::String(p), Value::String(r)) => {
+                                let re = build_regex(p, flags)?;
+                                results.push(Value::String(re.replace(s, r.as_str()).to_string()));
+                            }
+                            _ => {
+                                return Err(EvalError::Qf(QfError::TypeError(
+                                    "sub requires strings".into(),
+                                )))
+                            }
+                        }
+                    }
                 }
-                _ => Err(QfError::TypeError("sub requires strings".into())),
             }
+            Ok(results)
         }
         ("gsub", 2) | ("gsub", 3) => {
-            let pattern = eval_one(&args[0], input, env)?;
-            let replacement = eval_one(&args[1], input, env)?;
-            let flags = if args.len() > 2 {
-                eval_one(&args[2], input, env)?.as_str().unwrap_or("").to_string()
+            let patterns = eval_inner(&args[0], input, env)?;
+            let replacements = eval_inner(&args[1], input, env)?;
+            let flags_list = if args.len() > 2 {
+                eval_inner(&args[2], input, env)?
+                    .into_iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
             } else {
-                String::new()
+                vec![String::new()]
             };
-            match (input, &pattern, &replacement) {
-                (Value::String(s), Value::String(p), Value::String(r)) => {
-                    let re = build_regex(p, &flags)?;
-                    Ok(vec![Value::String(re.replace_all(s, r.as_str()).to_string())])
+            let mut results = Vec::new();
+            for pattern in &patterns {
+                for replacement in &replacements {
+                    for flags in &flags_list {
+                        match (input, pattern, replacement) {
+                            (Value::String(s), Value::String(p), Value::String(r)) => {
+                                let re = build_regex(p, flags)?;
+                                results
+                                    .push(Value::String(re.replace_all(s, r.as_str()).to_string()));
+                            }
+                            _ => {
+                                return Err(EvalError::Qf(QfError::TypeError(
+                                    "gsub requires strings".into(),
+                                )))
+                            }
+                        }
+                    }
                 }
-                _ => Err(QfError::TypeError("gsub requires strings".into())),
             }
+            Ok(results)
         }
 
         // ── Selection helpers ──────────────────────────────
-        ("first", 1) => {
-            let vals = eval(&args[0], input, env)?;
-            Ok(vals.into_iter().take(1).collect())
-        }
         ("first", 0) => match input {
             Value::Array(arr) => Ok(vec![arr.first().cloned().unwrap_or(Value::Null)]),
             _ => Ok(vec![input.clone()]),
         },
-        ("last", 1) => {
-            let vals = eval(&args[0], input, env)?;
-            Ok(vals.into_iter().last().into_iter().collect())
-        }
         ("last", 0) => match input {
             Value::Array(arr) => Ok(vec![arr.last().cloned().unwrap_or(Value::Null)]),
             _ => Ok(vec![input.clone()]),
         },
         ("nth", 1) => {
-            let n = eval_one(&args[0], input, env)?;
-            let idx = n.as_u64().unwrap_or(0) as usize;
-            match input {
-                Value::Array(arr) => Ok(vec![arr.get(idx).cloned().unwrap_or(Value::Null)]),
-                _ => Ok(vec![Value::Null]),
-            }
-        }
-        ("limit", 2) => {
-            let n = eval_one(&args[0], input, env)?;
-            let count = n.as_u64().unwrap_or(0) as usize;
-            let vals = eval(&args[1], input, env)?;
-            Ok(vals.into_iter().take(count).collect())
-        }
-        ("recurse", 0) => {
+            let ns = eval_inner(&args[0], input, env)?;
             let mut results = Vec::new();
-            recurse_all(input, &mut results);
-            Ok(results)
-        }
-        ("recurse", 1) => {
-            let mut results = vec![input.clone()];
-            let mut current = vec![input.clone()];
-            for _ in 0..256 {
-                let mut next = Vec::new();
-                for val in &current {
-                    match eval(&args[0], val, env) {
-                        Ok(vals) => {
-                            for v in vals {
-                                if !v.is_null() {
-                                    next.push(v);
-                                }
-                            }
-                        }
-                        Err(_) => {}
-                    }
+            for n in ns {
+                let idx = n.as_u64().unwrap_or(0) as usize;
+                match input {
+                    Value::Array(arr) => results.push(arr.get(idx).cloned().unwrap_or(Value::Null)),
+                    _ => results.push(Value::Null),
                 }
-                if next.is_empty() {
-                    break;
-                }
-                results.extend(next.clone());
-                current = next;
             }
             Ok(results)
         }
         ("until", 2) => {
             let mut val = input.clone();
-            for _ in 0..10000 {
-                let cond = eval_one(&args[0], &val, env)?;
-                if is_truthy(&cond) {
+            loop {
+                let conds = eval_inner(&args[0], &val, env)?;
+                if conds.iter().any(is_truthy) {
                     return Ok(vec![val]);
                 }
-                val = eval_one(&args[1], &val, env)?;
-            }
-            Err(QfError::Runtime("until: loop limit exceeded".into()))
-        }
-        ("while", 2) => {
-            let mut val = input.clone();
-            let mut results = Vec::new();
-            for _ in 0..10000 {
-                let cond = eval_one(&args[0], &val, env)?;
-                if !is_truthy(&cond) {
-                    break;
+                let next = eval_inner(&args[1], &val, env)?;
+                if let Some(nv) = next.into_iter().next() {
+                    val = nv;
+                } else {
+                    return Ok(vec![]);
                 }
-                results.push(val.clone());
-                val = eval_one(&args[1], &val, env)?;
             }
-            Ok(results)
-        }
-        ("repeat", 1) => {
-            let mut val = input.clone();
-            let mut results = Vec::new();
-            for _ in 0..10000 {
-                results.push(val.clone());
-                val = eval_one(&args[0], &val, env)?;
-            }
-            Ok(results)
         }
 
         // ── Math ───────────────────────────────────────────
@@ -882,9 +1166,19 @@ pub fn call_builtin(
         ("exp", 0) => num_op(input, f64::exp),
         ("exp2", 0) => num_op(input, f64::exp2),
         ("pow", 2) => {
-            let base = eval_one(&args[0], input, env)?.as_f64().unwrap_or(0.0);
-            let exp = eval_one(&args[1], input, env)?.as_f64().unwrap_or(0.0);
-            Ok(vec![json_f64(base.powf(exp))])
+            let bases = eval_inner(&args[0], input, env)?;
+            let exps = eval_inner(&args[1], input, env)?;
+            let mut results = Vec::new();
+            for base in &bases {
+                for exp in &exps {
+                    results.push(json_f64(
+                        base.as_f64()
+                            .unwrap_or(0.0)
+                            .powf(exp.as_f64().unwrap_or(0.0)),
+                    ));
+                }
+            }
+            Ok(results)
         }
         ("sin", 0) => num_op(input, f64::sin),
         ("cos", 0) => num_op(input, f64::cos),
@@ -893,9 +1187,17 @@ pub fn call_builtin(
         ("acos", 0) => num_op(input, f64::acos),
         ("atan", 0) => num_op(input, f64::atan),
         ("atan2", 2) => {
-            let y = eval_one(&args[0], input, env)?.as_f64().unwrap_or(0.0);
-            let x = eval_one(&args[1], input, env)?.as_f64().unwrap_or(0.0);
-            Ok(vec![json_f64(y.atan2(x))])
+            let ys = eval_inner(&args[0], input, env)?;
+            let xs = eval_inner(&args[1], input, env)?;
+            let mut results = Vec::new();
+            for y in &ys {
+                for x in &xs {
+                    results.push(json_f64(
+                        y.as_f64().unwrap_or(0.0).atan2(x.as_f64().unwrap_or(0.0)),
+                    ));
+                }
+            }
+            Ok(results)
         }
 
         // ── JSON ───────────────────────────────────────────
@@ -908,20 +1210,15 @@ pub fn call_builtin(
                     .map_err(|e| QfError::Runtime(format!("fromjson: {e}")))?;
                 Ok(vec![v])
             }
-            _ => Err(QfError::TypeError("fromjson requires string".into())),
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "fromjson requires string".into(),
+            ))),
         },
 
         // ── Paths ──────────────────────────────────────────
         ("path", 1) => {
-            let paths = super::eval::eval(
-                &Expr::Identity,
-                input,
-                env,
-            )?;
-            // Simplified: just return the path expression results as path arrays
-            let _ = paths;
-            // This is a simplified implementation
-            Ok(vec![Value::Array(vec![])])
+            let paths = collect_paths(&args[0], input, env)?;
+            Ok(paths.into_iter().map(path_segments_to_value).collect())
         }
         ("paths", 0) => {
             let mut result = Vec::new();
@@ -939,72 +1236,113 @@ pub fn call_builtin(
             Ok(result)
         }
         ("getpath", 1) => {
-            let path = eval_one(&args[0], input, env)?;
-            match &path {
-                Value::Array(arr) => {
-                    let mut current = input.clone();
-                    for seg in arr {
-                        current = match seg {
-                            Value::String(k) => current
-                                .as_object()
-                                .and_then(|m| m.get(k).cloned())
-                                .unwrap_or(Value::Null),
-                            Value::Number(n) => {
-                                let i = n.as_i64().unwrap_or(0);
-                                current
-                                    .as_array()
-                                    .and_then(|a| a.get(i as usize).cloned())
-                                    .unwrap_or(Value::Null)
-                            }
-                            _ => Value::Null,
-                        };
+            let paths = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for path in paths {
+                match &path {
+                    Value::Array(arr) => {
+                        let mut current = input.clone();
+                        for seg in arr {
+                            current = match seg {
+                                Value::String(k) => current
+                                    .as_object()
+                                    .and_then(|m| m.get(k).cloned())
+                                    .unwrap_or(Value::Null),
+                                Value::Number(n) => {
+                                    let i = n.as_i64().unwrap_or(0);
+                                    current
+                                        .as_array()
+                                        .and_then(|a| a.get(i as usize).cloned())
+                                        .unwrap_or(Value::Null)
+                                }
+                                _ => Value::Null,
+                            };
+                        }
+                        results.push(current);
                     }
-                    Ok(vec![current])
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "getpath requires array".into(),
+                        )))
+                    }
                 }
-                _ => Err(QfError::TypeError("getpath requires array".into())),
             }
+            Ok(results)
         }
         ("setpath", 2) => {
-            let path = eval_one(&args[0], input, env)?;
-            let val = eval_one(&args[1], input, env)?;
-            match &path {
-                Value::Array(arr) => {
-                    let segments: Vec<super::eval::PathSegment> = arr
-                        .iter()
-                        .filter_map(|v| match v {
-                            Value::String(s) => Some(super::eval::PathSegment::Key(s.clone())),
-                            Value::Number(n) => {
-                                Some(super::eval::PathSegment::Index(n.as_i64().unwrap_or(0)))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    Ok(vec![super::eval::set_path_pub(input, &segments, val)?])
-                }
-                _ => Err(QfError::TypeError("setpath requires array path".into())),
-            }
-        }
-        ("delpaths", 1) => {
-            let paths_val = eval_one(&args[0], input, env)?;
-            match &paths_val {
-                Value::Array(paths) => {
-                    let mut result = input.clone();
-                    // Delete paths in reverse order to avoid index shifting
-                    let mut sorted_paths: Vec<&Value> = paths.iter().collect();
-                    sorted_paths.sort_by(|a, b| {
-                        let la = a.as_array().map(|v| v.len()).unwrap_or(0);
-                        let lb = b.as_array().map(|v| v.len()).unwrap_or(0);
-                        lb.cmp(&la)
-                    });
-                    for path in sorted_paths {
-                        if let Value::Array(segs) = path {
-                            result = delete_path(&result, segs);
+            let paths = eval_inner(&args[0], input, env)?;
+            let vals = eval_inner(&args[1], input, env)?;
+            let mut results = Vec::new();
+            for path in &paths {
+                for val in &vals {
+                    match path {
+                        Value::Array(arr) => {
+                            let segments: Vec<PathSegment> = arr
+                                .iter()
+                                .filter_map(|v| match v {
+                                    Value::String(s) => Some(PathSegment::Key(s.clone())),
+                                    Value::Number(n) => {
+                                        Some(PathSegment::Index(n.as_i64().unwrap_or(0)))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            results.push(super::eval::set_path_pub(input, &segments, val.clone())?);
+                        }
+                        _ => {
+                            return Err(EvalError::Qf(QfError::TypeError(
+                                "setpath requires array path".into(),
+                            )))
                         }
                     }
-                    Ok(vec![result])
                 }
-                _ => Err(QfError::TypeError("delpaths requires array".into())),
             }
+            Ok(results)
+        }
+        ("delpaths", 1) => {
+            let paths_vals = eval_inner(&args[0], input, env)?;
+            let mut results = Vec::new();
+            for paths_val in paths_vals {
+                match &paths_val {
+                    Value::Array(paths) => {
+                        let mut seg_paths: Vec<Vec<PathSegment>> = Vec::with_capacity(paths.len());
+                        for path in paths {
+                            match path {
+                                Value::Array(segs) => {
+                                    let segs: Vec<PathSegment> = segs
+                                        .iter()
+                                        .filter_map(|v| match v {
+                                            Value::String(s) => Some(PathSegment::Key(s.clone())),
+                                            Value::Number(n) => {
+                                                Some(PathSegment::Index(n.as_i64().unwrap_or(0)))
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    seg_paths.push(segs);
+                                }
+                                _ => {
+                                    return Err(EvalError::Qf(QfError::TypeError(
+                                        "delpaths: path must be array".into(),
+                                    )))
+                                }
+                            }
+                        }
+                        sort_paths_for_deletion(&mut seg_paths);
+                        let mut result = input.clone();
+                        for path in &seg_paths {
+                            result = delete_path_segments(&result, path);
+                        }
+                        results.push(result);
+                    }
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "delpaths requires array".into(),
+                        )))
+                    }
+                }
+            }
+            Ok(results)
         }
 
         // ── Environment ────────────────────────────────────
@@ -1024,55 +1362,23 @@ pub fn call_builtin(
         ("true", 0) => Ok(vec![Value::Bool(true)]),
         ("false", 0) => Ok(vec![Value::Bool(false)]),
         ("input", 0) => Ok(vec![Value::Null]), // simplified
-        ("inputs", 0) => Ok(vec![]),            // simplified
+        ("inputs", 0) => Ok(vec![]),           // simplified
 
         // ── Array manipulation ─────────────────────────────
         ("del", 1) => {
-            // del(.foo) removes the key
-            // We need to collect paths and delete them
-            match &args[0] {
-                Expr::Field(name) => match input {
-                    Value::Object(map) => {
-                        let mut new_map = map.clone();
-                        new_map.remove(name);
-                        Ok(vec![Value::Object(new_map)])
-                    }
-                    _ => Ok(vec![input.clone()]),
-                },
-                Expr::Index(base, idx_expr) => {
-                    let idx = eval_one(idx_expr, input, env)?;
-                    let base_val = eval_one(base, input, env)?;
-                    match (&base_val, &idx) {
-                        (Value::Array(arr), Value::Number(n)) => {
-                            let i = n.as_i64().unwrap_or(0) as usize;
-                            let mut new_arr = arr.clone();
-                            if i < new_arr.len() {
-                                new_arr.remove(i);
-                            }
-                            Ok(vec![Value::Array(new_arr)])
-                        }
-                        (Value::Object(map), Value::String(k)) => {
-                            let mut new_map = map.clone();
-                            new_map.remove(k);
-                            Ok(vec![Value::Object(new_map)])
-                        }
-                        _ => Ok(vec![input.clone()]),
-                    }
-                }
-                Expr::Pipe(_left, _right) => {
-                    // del(.foo.bar) — need proper path deletion
-                    let paths = super::eval::collect_paths_pub(&args[0], input, env)?;
-                    let mut result = input.clone();
-                    for path in paths.iter().rev() {
-                        result = delete_path_segments(&result, path);
-                    }
-                    Ok(vec![result])
-                }
-                _ => Ok(vec![input.clone()]),
+            let mut paths = collect_paths(&args[0], input, env)?;
+            sort_paths_for_deletion(&mut paths);
+            let mut result = input.clone();
+            for path in &paths {
+                result = delete_path_segments(&result, path);
             }
+            Ok(vec![result])
         }
 
-        _ => Err(QfError::UndefinedFunction(name.to_string(), args.len())),
+        _ => Err(EvalError::Qf(QfError::UndefinedFunction(
+            name.to_string(),
+            args.len(),
+        ))),
     }
 }
 
@@ -1151,14 +1457,10 @@ fn keys(input: &Value, sort: bool) -> Result<Value, QfError> {
             if sort {
                 ks.sort();
             }
-            Ok(Value::Array(
-                ks.into_iter().map(Value::String).collect(),
-            ))
+            Ok(Value::Array(ks.into_iter().map(Value::String).collect()))
         }
         Value::Array(a) => Ok(Value::Array(
-            (0..a.len())
-                .map(|i| Value::Number(i.into()))
-                .collect(),
+            (0..a.len()).map(|i| Value::Number(i.into())).collect(),
         )),
         _ => Err(QfError::TypeError(format!(
             "keys requires object or array, got {}",
@@ -1193,10 +1495,12 @@ fn flatten_recursive(arr: &[Value], depth: usize, result: &mut Vec<Value>) {
 fn value_contains(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a.contains(b.as_str()),
-        (Value::Array(a), Value::Array(b)) => b.iter().all(|bv| a.iter().any(|av| value_contains(av, bv))),
-        (Value::Object(a), Value::Object(b)) => {
-            b.iter().all(|(k, bv)| a.get(k).is_some_and(|av| value_contains(av, bv)))
+        (Value::Array(a), Value::Array(b)) => {
+            b.iter().all(|bv| a.iter().any(|av| value_contains(av, bv)))
         }
+        (Value::Object(a), Value::Object(b)) => b
+            .iter()
+            .all(|(k, bv)| a.get(k).is_some_and(|av| value_contains(av, bv))),
         _ => a == b,
     }
 }
@@ -1211,16 +1515,16 @@ fn json_f64(f: f64) -> Value {
     }
 }
 
-fn num_op(input: &Value, f: fn(f64) -> f64) -> Result<Vec<Value>, QfError> {
+fn num_op(input: &Value, f: fn(f64) -> f64) -> Result<Vec<Value>, EvalError> {
     match input {
         Value::Number(n) => {
             let result = f(n.as_f64().unwrap_or(0.0));
             Ok(vec![json_f64(result)])
         }
-        _ => Err(QfError::TypeError(format!(
+        _ => Err(EvalError::Qf(QfError::TypeError(format!(
             "number required, got {}",
             value_type(input)
-        ))),
+        )))),
     }
 }
 
@@ -1286,8 +1590,7 @@ fn format_as_csv(input: &Value, delimiter: u8) -> Result<Vec<Value>, QfError> {
             let bytes = wtr
                 .into_inner()
                 .map_err(|e| QfError::Runtime(e.to_string()))?;
-            let s = String::from_utf8(bytes)
-                .map_err(|e| QfError::Runtime(e.to_string()))?;
+            let s = String::from_utf8(bytes).map_err(|e| QfError::Runtime(e.to_string()))?;
             Ok(vec![Value::String(s.trim_end().to_string())])
         }
         _ => Err(QfError::TypeError("@csv/@tsv requires array".into())),
@@ -1296,23 +1599,6 @@ fn format_as_csv(input: &Value, delimiter: u8) -> Result<Vec<Value>, QfError> {
 
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     super::eval::compare_values_pub(a, b)
-}
-
-fn recurse_all(val: &Value, results: &mut Vec<Value>) {
-    results.push(val.clone());
-    match val {
-        Value::Array(arr) => {
-            for item in arr {
-                recurse_all(item, results);
-            }
-        }
-        Value::Object(map) => {
-            for v in map.values() {
-                recurse_all(v, results);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn collect_all_paths(val: &Value, current: &mut Vec<Value>, result: &mut Vec<Value>) {
@@ -1343,9 +1629,9 @@ fn collect_all_paths_filtered(
     result: &mut Vec<Value>,
     filter: &Expr,
     env: &Env,
-) -> Result<(), QfError> {
-    let filter_result = eval_one(filter, val, env)?;
-    if is_truthy(&filter_result) {
+) -> Result<(), EvalError> {
+    let filter_results = eval_inner(filter, val, env)?;
+    if filter_results.iter().any(is_truthy) {
         result.push(Value::Array(current.clone()));
     }
     match val {
@@ -1390,112 +1676,118 @@ fn collect_leaf_paths(val: &Value, current: &mut Vec<Value>, result: &mut Vec<Va
     }
 }
 
-fn delete_path(val: &Value, path: &[Value]) -> Value {
-    if path.is_empty() {
-        return Value::Null;
-    }
-    let seg = &path[0];
-    let rest = &path[1..];
-    match (val, seg) {
-        (Value::Object(map), Value::String(key)) => {
-            if rest.is_empty() {
-                let mut new_map = map.clone();
-                new_map.remove(key);
-                Value::Object(new_map)
-            } else {
-                let mut new_map = map.clone();
-                if let Some(child) = map.get(key) {
-                    new_map.insert(key.clone(), delete_path(child, rest));
-                }
-                Value::Object(new_map)
-            }
-        }
-        (Value::Array(arr), Value::Number(n)) => {
-            let idx = n.as_i64().unwrap_or(0) as usize;
-            if rest.is_empty() {
-                let mut new_arr = arr.clone();
-                if idx < new_arr.len() {
-                    new_arr.remove(idx);
-                }
-                Value::Array(new_arr)
-            } else {
-                let mut new_arr = arr.clone();
-                if let Some(child) = arr.get(idx) {
-                    new_arr[idx] = delete_path(child, rest);
-                }
-                Value::Array(new_arr)
-            }
-        }
-        _ => val.clone(),
-    }
-}
-
-fn delete_path_segments(val: &Value, path: &[super::eval::PathSegment]) -> Value {
-    use super::eval::PathSegment;
-    if path.is_empty() {
-        return Value::Null;
-    }
-    let seg = &path[0];
-    let rest = &path[1..];
-    match (val, seg) {
-        (Value::Object(map), PathSegment::Key(key)) => {
-            if rest.is_empty() {
-                let mut new_map = map.clone();
-                new_map.remove(key);
-                Value::Object(new_map)
-            } else {
-                let mut new_map = map.clone();
-                if let Some(child) = map.get(key) {
-                    new_map.insert(key.clone(), delete_path_segments(child, rest));
-                }
-                Value::Object(new_map)
-            }
-        }
-        (Value::Array(arr), PathSegment::Index(i)) => {
-            let idx = if *i < 0 {
-                (arr.len() as i64 + i) as usize
-            } else {
-                *i as usize
-            };
-            if rest.is_empty() {
-                let mut new_arr = arr.clone();
-                if idx < new_arr.len() {
-                    new_arr.remove(idx);
-                }
-                Value::Array(new_arr)
-            } else {
-                let mut new_arr = arr.clone();
-                if let Some(child) = arr.get(idx) {
-                    new_arr[idx] = delete_path_segments(child, rest);
-                }
-                Value::Array(new_arr)
-            }
-        }
-        _ => val.clone(),
-    }
-}
-
 fn builtin_names() -> Vec<String> {
     vec![
-        "length", "utf8bytelength", "keys", "keys_unsorted", "values", "has", "in", "type",
-        "infinite", "nan", "isinfinite", "isnan", "isnormal", "builtins",
-        "select", "empty", "error", "debug",
-        "map", "map_values", "to_entries", "from_entries", "with_entries", "transpose",
-        "add", "any", "all", "flatten", "range",
-        "sort", "sort_by", "group_by", "unique", "unique_by", "reverse",
-        "min", "max", "min_by", "max_by",
-        "contains", "inside", "indices", "index", "rindex",
-        "tostring", "tonumber", "ascii_downcase", "ascii_upcase",
-        "ltrimstr", "rtrimstr", "trim", "split", "join",
-        "startswith", "endswith", "ascii", "explode", "implode",
-        "test", "match", "capture", "scan", "sub", "gsub",
-        "first", "last", "nth", "limit", "recurse", "until", "while", "repeat",
-        "floor", "ceil", "round", "fabs", "sqrt", "log", "log2", "log10",
-        "exp", "exp2", "pow", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-        "tojson", "fromjson",
-        "path", "paths", "leaf_paths", "getpath", "setpath", "delpaths",
-        "env", "not", "null", "true", "false", "input", "inputs", "del",
-    ].into_iter().map(String::from).collect()
+        "length",
+        "utf8bytelength",
+        "keys",
+        "keys_unsorted",
+        "values",
+        "has",
+        "in",
+        "type",
+        "infinite",
+        "nan",
+        "isinfinite",
+        "isnan",
+        "isnormal",
+        "builtins",
+        "select",
+        "empty",
+        "error",
+        "debug",
+        "map",
+        "map_values",
+        "to_entries",
+        "from_entries",
+        "with_entries",
+        "transpose",
+        "add",
+        "any",
+        "all",
+        "flatten",
+        "range",
+        "sort",
+        "sort_by",
+        "group_by",
+        "unique",
+        "unique_by",
+        "reverse",
+        "min",
+        "max",
+        "min_by",
+        "max_by",
+        "contains",
+        "inside",
+        "indices",
+        "index",
+        "rindex",
+        "tostring",
+        "tonumber",
+        "ascii_downcase",
+        "ascii_upcase",
+        "ltrimstr",
+        "rtrimstr",
+        "trim",
+        "split",
+        "join",
+        "startswith",
+        "endswith",
+        "ascii",
+        "explode",
+        "implode",
+        "test",
+        "match",
+        "capture",
+        "scan",
+        "sub",
+        "gsub",
+        "first",
+        "last",
+        "nth",
+        "limit",
+        "recurse",
+        "until",
+        "while",
+        "repeat",
+        "floor",
+        "ceil",
+        "round",
+        "fabs",
+        "sqrt",
+        "log",
+        "log2",
+        "log10",
+        "exp",
+        "exp2",
+        "pow",
+        "sin",
+        "cos",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "atan2",
+        "tojson",
+        "fromjson",
+        "path",
+        "paths",
+        "leaf_paths",
+        "getpath",
+        "setpath",
+        "delpaths",
+        "env",
+        "not",
+        "null",
+        "true",
+        "false",
+        "input",
+        "inputs",
+        "del",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[cfg(test)]
@@ -1539,10 +1831,7 @@ mod tests {
     fn test_contains() {
         assert!(value_contains(&json!("foobar"), &json!("foo")));
         assert!(value_contains(&json!([1, 2, 3]), &json!([2])));
-        assert!(value_contains(
-            &json!({"a": 1, "b": 2}),
-            &json!({"a": 1})
-        ));
+        assert!(value_contains(&json!({"a": 1, "b": 2}), &json!({"a": 1})));
     }
 
     #[test]

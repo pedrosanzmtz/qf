@@ -5,12 +5,12 @@ use serde_json::Value;
 use super::ast::Expr;
 
 #[derive(Debug, Clone)]
-pub struct FuncDef {
-    pub params: Vec<String>,
-    pub body: Expr,
+pub enum FuncDef {
+    User { params: Vec<String>, body: Expr },
+    Closure { expr: Expr, env: Box<Env> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Env {
     variables: HashMap<String, Value>,
     functions: HashMap<(String, usize), FuncDef>,
