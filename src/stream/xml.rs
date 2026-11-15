@@ -3,125 +3,82 @@ use quick_xml::Reader;
 use serde_json::Value;
 
 use crate::error::QfError;
+use crate::parser::xml::ElementBuilder;
 use crate::query;
 
 /// Stream XML elements, applying the query to each top-level child element.
-pub fn stream_xml<F>(
-    input: &str,
-    query_str: &str,
-    on_result: &mut F,
-) -> Result<(), QfError>
+pub fn stream_xml<F>(input: &str, query_str: &str, on_result: &mut F) -> Result<(), QfError>
 where
     F: FnMut(Value) -> Result<(), QfError>,
 {
     let mut reader = Reader::from_str(input);
+    reader.config_mut().trim_text(true);
+
     let mut depth: usize = 0;
-    let mut current_element = String::new();
+    let mut stack: Vec<ElementBuilder> = Vec::new();
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 depth += 1;
-                if depth == 2 {
-                    // Start collecting a top-level child element
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    let mut element_xml = String::new();
-                    element_xml.push('<');
-                    element_xml.push_str(&tag);
-                    for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let val = String::from_utf8_lossy(&attr.value);
-                        element_xml.push(' ');
-                        element_xml.push_str(&key);
-                        element_xml.push_str("=\"");
-                        element_xml.push_str(&val);
-                        element_xml.push('"');
-                    }
-                    element_xml.push('>');
-                    current_element = element_xml;
-                } else if depth > 2 {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    current_element.push('<');
-                    current_element.push_str(&tag);
-                    for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let val = String::from_utf8_lossy(&attr.value);
-                        current_element.push(' ');
-                        current_element.push_str(&key);
-                        current_element.push_str("=\"");
-                        current_element.push_str(&val);
-                        current_element.push('"');
-                    }
-                    current_element.push('>');
+                if depth >= 2 {
+                    stack.push(ElementBuilder::from_start(e)?);
                 }
             }
             Ok(Event::End(ref e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if depth == 2 {
-                    current_element.push_str("</");
-                    current_element.push_str(&tag);
-                    current_element.push('>');
-
-                    // Parse the collected element and apply query
-                    let value: Value = quick_xml::de::from_str(&current_element)
-                        .map_err(|e| QfError::Parse(e.to_string()))?;
-                    let results = query::query(&value, query_str)?;
-                    for result in results {
-                        on_result(result)?;
+                if depth >= 2 {
+                    let end_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                    let builder = stack.pop().ok_or_else(|| {
+                        QfError::Parse(format!("unexpected closing tag </{end_name}>"))
+                    })?;
+                    let (name, value) = builder.finish();
+                    if name != end_name {
+                        return Err(QfError::Parse(format!(
+                            "mismatched closing tag: expected </{name}>, found </{end_name}>"
+                        )));
                     }
-                    current_element.clear();
-                } else if depth > 2 {
-                    current_element.push_str("</");
-                    current_element.push_str(&tag);
-                    current_element.push('>');
-                }
-                depth -= 1;
-            }
-            Ok(Event::Empty(ref e)) => {
-                if depth >= 1 {
-                    let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                    if depth == 1 {
-                        // Self-closing top-level child
-                        let mut element_xml = format!("<{}", tag);
-                        for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(&attr.value);
-                            element_xml.push(' ');
-                            element_xml.push_str(&key);
-                            element_xml.push_str("=\"");
-                            element_xml.push_str(&val);
-                            element_xml.push('"');
-                        }
-                        element_xml.push_str("/>");
-
-                        let value: Value = quick_xml::de::from_str(&element_xml)
-                            .map_err(|e| QfError::Parse(e.to_string()))?;
+                    if stack.is_empty() {
                         let results = query::query(&value, query_str)?;
                         for result in results {
                             on_result(result)?;
                         }
-                    } else {
-                        current_element.push('<');
-                        current_element.push_str(&tag);
-                        for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(&attr.value);
-                            current_element.push(' ');
-                            current_element.push_str(&key);
-                            current_element.push_str("=\"");
-                            current_element.push_str(&val);
-                            current_element.push('"');
+                    } else if let Some(parent) = stack.last_mut() {
+                        parent.add_child(name, value);
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Empty(ref e)) => {
+                if depth >= 1 {
+                    let builder = ElementBuilder::from_start(e)?;
+                    let (name, value) = builder.finish();
+                    if depth == 1 {
+                        let results = query::query(&value, query_str)?;
+                        for result in results {
+                            on_result(result)?;
                         }
-                        current_element.push_str("/>");
+                    } else if let Some(parent) = stack.last_mut() {
+                        parent.add_child(name, value);
                     }
                 }
             }
             Ok(Event::Text(ref e)) => {
-                if depth >= 2 {
-                    let text = e.unescape().map_err(|e| QfError::Parse(e.to_string()))?;
-                    // Escape for XML
-                    current_element.push_str(&text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
+                if let Some(current) = stack.last_mut() {
+                    let text = e
+                        .unescape()
+                        .map_err(|err| QfError::Parse(err.to_string()))?;
+                    if !text.is_empty() {
+                        current.push_text(&text);
+                    }
+                }
+            }
+            Ok(Event::CData(ref e)) => {
+                if let Some(current) = stack.last_mut() {
+                    let text = String::from_utf8_lossy(e.as_ref());
+                    if !text.is_empty() {
+                        current.push_text(&text);
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -131,12 +88,20 @@ where
         buf.clear();
     }
 
+    if let Some(unclosed) = stack.pop() {
+        return Err(QfError::Parse(format!(
+            "unclosed XML element <{}>",
+            unclosed.finish().0
+        )));
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn stream_xml_elements() {
@@ -148,5 +113,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(results.len(), 2);
+        assert_eq!(results[0], json!({"name": "a"}));
+        assert_eq!(results[1], json!({"name": "b"}));
+    }
+
+    #[test]
+    fn stream_xml_with_repeated_nested_and_attrs() {
+        let input = r#"<root><order id="1"><tag>fast</tag><tag>fragile</tag></order><order id="2"/></root>"#;
+        let mut results = Vec::new();
+        stream_xml(input, ".", &mut |v| {
+            results.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], json!({"@id": "1", "tag": ["fast", "fragile"]}));
+        assert_eq!(results[1], json!({"@id": "2"}));
+    }
+
+    #[test]
+    fn stream_xml_query_field() {
+        let input = "<root><user><name>Alice</name></user><user><name>Bob</name></user></root>";
+        let mut results = Vec::new();
+        stream_xml(input, ".name", &mut |v| {
+            results.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(results, vec![json!("Alice"), json!("Bob")]);
+    }
+
+    #[test]
+    fn stream_xml_entities_and_cdata() {
+        let input = r#"<root><msg note="a &amp; b"><![CDATA[hello <world>]]></msg></root>"#;
+        let mut results = Vec::new();
+        stream_xml(input, ".", &mut |v| {
+            results.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            results,
+            vec![json!({"@note": "a & b", "$text": "hello <world>"})]
+        );
     }
 }
