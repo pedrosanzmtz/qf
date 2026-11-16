@@ -74,9 +74,15 @@ tags = ["cli", "rust", "query"]
     fn datetimes() {
         let input = r#"
 created = 2024-01-15T10:30:00Z
+updated = 2024-01-15T10:30:00+02:00
+local = 2024-01-15T10:30:00
+date_only = 2024-01-15
 "#;
         let val = parse(input).unwrap();
-        assert!(val["created"].as_str().unwrap().contains("2024-01-15"));
+        assert_eq!(val["created"], "2024-01-15T10:30:00Z");
+        assert_eq!(val["updated"], "2024-01-15T10:30:00+02:00");
+        assert_eq!(val["local"], "2024-01-15T10:30:00");
+        assert_eq!(val["date_only"], "2024-01-15");
     }
 
     #[test]
