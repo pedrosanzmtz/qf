@@ -183,16 +183,13 @@ impl std::fmt::Display for CliError {
 impl From<QfError> for CliError {
     fn from(err: QfError) -> Self {
         let code = match err {
-            QfError::SyntaxError { .. } | QfError::InvalidQuery(_) => 3,
+            QfError::SyntaxError { .. } => 3,
             QfError::Io(_)
             | QfError::UnsupportedFormat(_)
             | QfError::NoExtension
             | QfError::UnknownExtension(_) => 2,
             QfError::Parse(_)
-            | QfError::PathNotFound(_)
-            | QfError::IndexOutOfBounds { .. }
-            | QfError::ExpectedArray(_)
-            | QfError::ExpectedObject(_)
+            | QfError::Serialize(_)
             | QfError::TypeError(_)
             | QfError::UndefinedVariable(_)
             | QfError::UndefinedFunction(_, _)
