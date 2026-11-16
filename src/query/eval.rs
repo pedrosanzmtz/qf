@@ -1,6 +1,10 @@
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 use crate::error::QfError;
+
+static NULL_VALUE: Value = Value::Null;
 
 use super::ast::*;
 use super::builtins;
@@ -58,12 +62,248 @@ pub fn eval(expr: &Expr, input: &Value, env: &Env) -> Result<Vec<Value>, QfError
 }
 
 pub(crate) fn eval_inner(expr: &Expr, input: &Value, env: &Env) -> Result<Vec<Value>, EvalError> {
+    if let Some(res) = eval_one_ref(expr, input, env) {
+        return Ok(vec![res?.into_owned()]);
+    }
     let mut results = Vec::new();
     eval_stream(expr, input, env, &mut |v| {
         results.push(v);
         Ok(true)
     })?;
     Ok(results)
+}
+
+/// Fast-path single-value evaluator returning a borrowed `Cow<'a, Value>` when possible.
+/// Returns `None` if `expr` may produce zero or multiple outputs or requires streaming.
+fn eval_one_ref<'a>(
+    expr: &'a Expr,
+    input: &'a Value,
+    env: &'a Env,
+) -> Option<Result<Cow<'a, Value>, EvalError>> {
+    match expr {
+        Expr::Identity => Some(Ok(Cow::Borrowed(input))),
+        Expr::Literal(val) => Some(Ok(Cow::Borrowed(val))),
+        Expr::StringLiteral(s) => Some(Ok(Cow::Owned(Value::String(s.clone())))),
+        Expr::Field(name) => Some(field_value_cow(input, name)),
+        Expr::OptionalField(name) => match input {
+            Value::Object(_) | Value::Null => Some(field_value_cow(input, name)),
+            _ => None,
+        },
+        Expr::VarRef(name) => match env.get_var(name) {
+            Some(val) => Some(Ok(Cow::Borrowed(val))),
+            None if name == "__loc__" => Some(Ok(Cow::Borrowed(&NULL_VALUE))),
+            None if name == "ENV" => None,
+            None => Some(Err(EvalError::Qf(QfError::UndefinedVariable(name.clone())))),
+        },
+        Expr::Index(base, idx_expr) => {
+            let val = match eval_one_ref(base, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let idx = match eval_one_ref(idx_expr, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(index_value_cow(val, &idx).map_err(EvalError::Qf))
+        }
+        Expr::Pipe(left, right) => {
+            let lv = match eval_one_ref(left, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            match lv {
+                Cow::Borrowed(lv_ref) => eval_one_ref(right, lv_ref, env),
+                Cow::Owned(lv_owned) => match eval_one_ref(right, &lv_owned, env)? {
+                    Ok(rv) => Some(Ok(Cow::Owned(rv.into_owned()))),
+                    Err(e) => Some(Err(e)),
+                },
+            }
+        }
+        Expr::Neg(inner) => {
+            let val = match eval_one_ref(inner, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(negate_value(&val).map(Cow::Owned).map_err(EvalError::Qf))
+        }
+        Expr::Not(inner) => {
+            let val = match eval_one_ref(inner, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(Ok(Cow::Owned(Value::Bool(!is_truthy(&val)))))
+        }
+        Expr::BinOp(op, left, right) => match op {
+            BinOp::And => {
+                let lv = match eval_one_ref(left, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                if !is_truthy(&lv) {
+                    return Some(Ok(Cow::Owned(Value::Bool(false))));
+                }
+                let rv = match eval_one_ref(right, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(Ok(Cow::Owned(Value::Bool(is_truthy(&rv)))))
+            }
+            BinOp::Or => {
+                let lv = match eval_one_ref(left, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                if is_truthy(&lv) {
+                    return Some(Ok(Cow::Owned(Value::Bool(true))));
+                }
+                let rv = match eval_one_ref(right, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(Ok(Cow::Owned(Value::Bool(is_truthy(&rv)))))
+            }
+            _ => {
+                let lv = match eval_one_ref(left, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                let rv = match eval_one_ref(right, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(
+                    eval_binop(op, &lv, &rv)
+                        .map(Cow::Owned)
+                        .map_err(EvalError::Qf),
+                )
+            }
+        },
+        Expr::If {
+            cond,
+            then_branch,
+            elif_branches,
+            else_branch,
+        } => {
+            let cv = match eval_one_ref(cond, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            if is_truthy(&cv) {
+                return eval_one_ref(then_branch, input, env);
+            }
+            for (elif_cond, elif_body) in elif_branches {
+                let ecv = match eval_one_ref(elif_cond, input, env)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                if is_truthy(&ecv) {
+                    return eval_one_ref(elif_body, input, env);
+                }
+            }
+            match else_branch {
+                Some(eb) => eval_one_ref(eb, input, env),
+                None => Some(Ok(Cow::Borrowed(input))),
+            }
+        }
+        Expr::As {
+            expr,
+            pattern,
+            body,
+        } => {
+            let val = match eval_one_ref(expr, input, env)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let mut child_env = env.child();
+            if let Err(e) = bind_pattern(&mut child_env, pattern, &val) {
+                return Some(Err(EvalError::Qf(e)));
+            }
+            match eval_one_ref(body, input, &child_env)? {
+                Ok(res) => Some(Ok(Cow::Owned(res.into_owned()))),
+                Err(e) => Some(Err(e)),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn field_value_cow<'a>(input: &'a Value, name: &str) -> Result<Cow<'a, Value>, EvalError> {
+    match input {
+        Value::Object(map) => Ok(Cow::Borrowed(map.get(name).unwrap_or(&NULL_VALUE))),
+        Value::Null => Ok(Cow::Borrowed(&NULL_VALUE)),
+        _ => Err(EvalError::Qf(QfError::TypeError(format!(
+            "cannot index {} with string \"{}\"",
+            value_type(input),
+            name
+        )))),
+    }
+}
+
+fn index_value_cow<'a>(val: Cow<'a, Value>, idx: &Value) -> Result<Cow<'a, Value>, QfError> {
+    match val {
+        Cow::Borrowed(v) => match (v, idx) {
+            (Value::Array(arr), Value::Number(n)) => {
+                let i = n.as_i64().unwrap_or(0);
+                let i = if i < 0 {
+                    (arr.len() as i64 + i) as usize
+                } else {
+                    i as usize
+                };
+                Ok(Cow::Borrowed(arr.get(i).unwrap_or(&NULL_VALUE)))
+            }
+            (Value::Object(map), Value::String(key)) => {
+                Ok(Cow::Borrowed(map.get(key).unwrap_or(&NULL_VALUE)))
+            }
+            (Value::Null, _) => Ok(Cow::Borrowed(&NULL_VALUE)),
+            _ => Err(QfError::TypeError(format!(
+                "cannot index {} with {}",
+                value_type(v),
+                value_type(idx)
+            ))),
+        },
+        Cow::Owned(v) => match (v, idx) {
+            (Value::Array(mut arr), Value::Number(n)) => {
+                let i = n.as_i64().unwrap_or(0);
+                let i = if i < 0 {
+                    (arr.len() as i64 + i) as usize
+                } else {
+                    i as usize
+                };
+                if i < arr.len() {
+                    Ok(Cow::Owned(arr.swap_remove(i)))
+                } else {
+                    Ok(Cow::Borrowed(&NULL_VALUE))
+                }
+            }
+            (Value::Object(mut map), Value::String(key)) => {
+                Ok(Cow::Owned(map.remove(key).unwrap_or(Value::Null)))
+            }
+            (Value::Null, _) => Ok(Cow::Borrowed(&NULL_VALUE)),
+            (v, _) => Err(QfError::TypeError(format!(
+                "cannot index {} with {}",
+                value_type(&v),
+                value_type(idx)
+            ))),
+        },
+    }
+}
+
+fn negate_value(val: &Value) -> Result<Value, QfError> {
+    match val {
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Number((-i).into()))
+            } else if let Some(f) = n.as_f64() {
+                Ok(json_f64(-f))
+            } else {
+                Err(QfError::TypeError("cannot negate number".into()))
+            }
+        }
+        _ => Err(QfError::TypeError(format!(
+            "cannot negate {}",
+            value_type(val)
+        ))),
+    }
 }
 
 /// Evaluate a jq expression lazily, streaming outputs to `emit`.
@@ -74,6 +314,10 @@ pub(crate) fn eval_stream(
     env: &Env,
     emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
 ) -> Result<bool, EvalError> {
+    if let Some(res) = eval_one_ref(expr, input, env) {
+        return emit(res?.into_owned());
+    }
+
     match expr {
         Expr::Identity => emit(input.clone()),
 
@@ -152,53 +396,23 @@ pub(crate) fn eval_stream(
             Ok(true)
         }),
 
-        Expr::Iterate(expr) => eval_stream(expr, input, env, &mut |val| match &val {
-            Value::Array(arr) => {
-                for item in arr {
-                    if !emit(item.clone())? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Value::Object(map) => {
-                for v in map.values() {
-                    if !emit(v.clone())? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Value::Null => Ok(true),
-            _ => Err(EvalError::Qf(QfError::TypeError(format!(
-                "cannot iterate over {}",
-                value_type(&val)
-            )))),
-        }),
+        Expr::Iterate(base) => stream_iterate(base, false, input, env, emit),
 
-        Expr::OptionalIterate(expr) => eval_stream(expr, input, env, &mut |val| match &val {
-            Value::Array(arr) => {
-                for item in arr {
-                    if !emit(item.clone())? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Value::Object(map) => {
-                for v in map.values() {
-                    if !emit(v.clone())? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            _ => Ok(true),
-        }),
+        Expr::OptionalIterate(base) => stream_iterate(base, true, input, env, emit),
 
-        Expr::Pipe(left, right) => eval_stream(left, input, env, &mut |val| {
-            eval_stream(right, &val, env, emit)
-        }),
+        Expr::Pipe(left, right) => match left.as_ref() {
+            Expr::Iterate(base) => stream_iterate_pipe(base, false, right, input, env, emit),
+            Expr::OptionalIterate(base) => stream_iterate_pipe(base, true, right, input, env, emit),
+            _ => {
+                if let Some(res) = eval_one_ref(left, input, env) {
+                    let val = res?;
+                    return eval_stream(right, &val, env, emit);
+                }
+                eval_stream(left, input, env, &mut |val| {
+                    eval_stream(right, &val, env, emit)
+                })
+            }
+        },
 
         Expr::Comma(left, right) => {
             if !eval_stream(left, input, env, emit)? {
@@ -211,28 +425,7 @@ pub(crate) fn eval_stream(
 
         Expr::StringLiteral(s) => emit(Value::String(s.clone())),
 
-        Expr::Neg(expr) => eval_stream(expr, input, env, &mut |val| {
-            let negated = match &val {
-                Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Value::Number((-i).into())
-                    } else if let Some(f) = n.as_f64() {
-                        json_f64(-f)
-                    } else {
-                        return Err(EvalError::Qf(QfError::TypeError(
-                            "cannot negate number".into(),
-                        )));
-                    }
-                }
-                _ => {
-                    return Err(EvalError::Qf(QfError::TypeError(format!(
-                        "cannot negate {}",
-                        value_type(&val)
-                    ))));
-                }
-            };
-            emit(negated)
-        }),
+        Expr::Neg(expr) => eval_stream(expr, input, env, &mut |val| emit(negate_value(&val)?)),
 
         Expr::BinOp(op, left, right) => match op {
             BinOp::And => eval_stream(left, input, env, &mut |lv| {
@@ -301,6 +494,25 @@ pub(crate) fn eval_stream(
         },
 
         Expr::ArrayConstruct(inner) => {
+            if let Expr::Iterate(base) = inner.as_ref() {
+                if let Some(res) = eval_one_ref(base, input, env) {
+                    return match res? {
+                        Cow::Owned(Value::Array(arr)) => emit(Value::Array(arr)),
+                        Cow::Borrowed(Value::Array(arr)) => emit(Value::Array(arr.clone())),
+                        val => {
+                            let mut vals = match &*val {
+                                Value::Object(map) => Vec::with_capacity(map.len()),
+                                _ => Vec::new(),
+                            };
+                            emit_iterate_value(&val, false, &mut |v| {
+                                vals.push(v);
+                                Ok(true)
+                            })?;
+                            emit(Value::Array(vals))
+                        }
+                    };
+                }
+            }
             let vals = eval_inner(inner, input, env)?;
             emit(Value::Array(vals))
         }
@@ -346,17 +558,42 @@ pub(crate) fn eval_stream(
             init,
             update,
         } => {
-            let items = eval_inner(expr, input, env)?;
             let mut accs = eval_inner(init, input, env)?;
-            for item in &items {
-                let mut next_accs = Vec::new();
-                for acc in &accs {
-                    let mut child_env = env.child();
-                    bind_pattern(&mut child_env, pattern, item)?;
-                    next_accs.extend(eval_inner(update, acc, &child_env)?);
+            let mut child_env = env.child();
+            if let Expr::Iterate(base) = expr.as_ref() {
+                if let Some(base_res) = eval_one_ref(base, input, env) {
+                    let base_val = base_res?;
+                    match &*base_val {
+                        Value::Array(arr) => {
+                            for item in arr {
+                                reduce_step(item, &mut accs, pattern, update, env, &mut child_env)?;
+                            }
+                        }
+                        Value::Object(map) => {
+                            for v in map.values() {
+                                reduce_step(v, &mut accs, pattern, update, env, &mut child_env)?;
+                            }
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(EvalError::Qf(QfError::TypeError(format!(
+                                "cannot iterate over {}",
+                                value_type(&base_val)
+                            ))));
+                        }
+                    }
+                    for acc in accs {
+                        if !emit(acc)? {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
                 }
-                accs = next_accs;
             }
+            eval_stream(expr, input, env, &mut |item| {
+                reduce_step(&item, &mut accs, pattern, update, env, &mut child_env)?;
+                Ok(true)
+            })?;
             for acc in accs {
                 if !emit(acc)? {
                     return Ok(false);
@@ -374,11 +611,11 @@ pub(crate) fn eval_stream(
         } => {
             let items = eval_inner(expr, input, env)?;
             let mut accs = eval_inner(init, input, env)?;
+            let mut child_env = env.child();
             for item in &items {
-                let mut next_accs = Vec::new();
+                let mut next_accs = Vec::with_capacity(accs.len());
                 for acc in &accs {
-                    let mut child_env = env.child();
-                    bind_pattern(&mut child_env, pattern, item)?;
+                    bind_for_step(&mut child_env, env, pattern, item)?;
                     let updated = eval_inner(update, acc, &child_env)?;
                     for u in &updated {
                         if let Some(ext) = extract {
@@ -532,6 +769,161 @@ pub(crate) fn eval_stream(
     }
 }
 
+fn stream_iterate(
+    base: &Expr,
+    optional: bool,
+    input: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    if let Some(res) = eval_one_ref(base, input, env) {
+        let val = res?;
+        return emit_iterate_value(&val, optional, emit);
+    }
+    eval_stream(base, input, env, &mut |val| {
+        emit_iterate_value(&val, optional, emit)
+    })
+}
+
+fn emit_iterate_value(
+    val: &Value,
+    optional: bool,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    match val {
+        Value::Array(arr) => {
+            for item in arr {
+                if !emit(item.clone())? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                if !emit(v.clone())? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Value::Null => Ok(true),
+        _ if optional => Ok(true),
+        _ => Err(EvalError::Qf(QfError::TypeError(format!(
+            "cannot iterate over {}",
+            value_type(val)
+        )))),
+    }
+}
+
+fn stream_iterate_pipe(
+    base: &Expr,
+    optional: bool,
+    right: &Expr,
+    input: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    if let Some(res) = eval_one_ref(base, input, env) {
+        let val = res?;
+        return match &*val {
+            Value::Array(arr) => {
+                for item in arr {
+                    if !eval_stream(right, item, env, emit)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Value::Object(map) => {
+                for v in map.values() {
+                    if !eval_stream(right, v, env, emit)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Value::Null => Ok(true),
+            _ if optional => Ok(true),
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
+                "cannot iterate over {}",
+                value_type(&val)
+            )))),
+        };
+    }
+    eval_stream(base, input, env, &mut |val| match &val {
+        Value::Array(arr) => {
+            for item in arr {
+                if !eval_stream(right, item, env, emit)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                if !eval_stream(right, v, env, emit)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Value::Null => Ok(true),
+        _ if optional => Ok(true),
+        _ => Err(EvalError::Qf(QfError::TypeError(format!(
+            "cannot iterate over {}",
+            value_type(&val)
+        )))),
+    })
+}
+
+fn bind_for_step(
+    child_env: &mut Env,
+    base_env: &Env,
+    pattern: &Pattern,
+    item: &Value,
+) -> Result<(), QfError> {
+    match pattern {
+        Pattern::Variable(name) => {
+            child_env.set_var(name.clone(), item.clone());
+            Ok(())
+        }
+        _ => {
+            *child_env = base_env.child();
+            bind_pattern(child_env, pattern, item)
+        }
+    }
+}
+
+fn reduce_step(
+    item: &Value,
+    accs: &mut Vec<Value>,
+    pattern: &Pattern,
+    update: &Expr,
+    base_env: &Env,
+    child_env: &mut Env,
+) -> Result<(), EvalError> {
+    if accs.is_empty() {
+        return Ok(());
+    }
+    if accs.len() == 1 {
+        bind_for_step(child_env, base_env, pattern, item)?;
+        if let Some(res) = eval_one_ref(update, &accs[0], child_env) {
+            accs[0] = res?.into_owned();
+        } else {
+            *accs = eval_inner(update, &accs[0], child_env)?;
+        }
+        return Ok(());
+    }
+    let mut next_accs = Vec::with_capacity(accs.len());
+    bind_for_step(child_env, base_env, pattern, item)?;
+    for acc in accs.iter() {
+        next_accs.extend(eval_inner(update, acc, child_env)?);
+    }
+    *accs = next_accs;
+    Ok(())
+}
+
 fn eval_if(
     cond: &Expr,
     then_branch: &Expr,
@@ -564,6 +956,9 @@ fn eval_if(
 
 /// Evaluate an expression expecting at most one output.
 pub fn eval_one(expr: &Expr, input: &Value, env: &Env) -> Result<Value, QfError> {
+    if let Some(res) = eval_one_ref(expr, input, env) {
+        return res.map(Cow::into_owned).map_err(EvalError::into_qf_error);
+    }
     let mut vals = eval(expr, input, env)?;
     match vals.len() {
         0 => Ok(Value::Null),
@@ -929,11 +1324,11 @@ fn eval_object_construct(
     env: &Env,
 ) -> Result<Vec<Value>, EvalError> {
     // Start with a single empty object, then for each entry expand
-    let mut current = vec![serde_json::Map::new()];
+    let mut current = vec![serde_json::Map::with_capacity(entries.len())];
 
     for entry in entries {
-        let mut next = Vec::new();
-        for obj in &current {
+        let mut next = Vec::with_capacity(current.len());
+        for mut obj in current {
             match entry {
                 ObjectEntry::KeyValue(key, val_expr) => {
                     let key_str = match key {
@@ -946,11 +1341,23 @@ fn eval_object_construct(
                                 .unwrap_or_default()
                         }
                     };
-                    let vals = eval_inner(val_expr, input, env)?;
-                    for v in &vals {
-                        let mut new_obj = obj.clone();
-                        new_obj.insert(key_str.clone(), v.clone());
-                        next.push(new_obj);
+                    if let Some(res) = eval_one_ref(val_expr, input, env) {
+                        obj.insert(key_str, res?.into_owned());
+                        next.push(obj);
+                    } else {
+                        let vals = eval_inner(val_expr, input, env)?;
+                        let mut iter = vals.into_iter().peekable();
+                        while let Some(v) = iter.next() {
+                            if iter.peek().is_none() {
+                                obj.insert(key_str, v);
+                                next.push(obj);
+                                break;
+                            } else {
+                                let mut new_obj = obj.clone();
+                                new_obj.insert(key_str.clone(), v);
+                                next.push(new_obj);
+                            }
+                        }
                     }
                 }
                 ObjectEntry::ComputedKeyValue(key_expr, val_expr) => {
@@ -966,9 +1373,9 @@ fn eval_object_construct(
                             }
                         };
                         let vals = eval_inner(val_expr, input, env)?;
-                        for v in &vals {
+                        for v in vals {
                             let mut new_obj = obj.clone();
-                            new_obj.insert(key_str.clone(), v.clone());
+                            new_obj.insert(key_str.clone(), v);
                             next.push(new_obj);
                         }
                     }
@@ -978,22 +1385,27 @@ fn eval_object_construct(
                         Value::Object(map) => map.get(name).cloned().unwrap_or(Value::Null),
                         _ => Value::Null,
                     };
-                    let mut new_obj = obj.clone();
-                    new_obj.insert(name.clone(), val);
-                    next.push(new_obj);
+                    obj.insert(name.clone(), val);
+                    next.push(obj);
                 }
                 ObjectEntry::ShorthandVar(name) => {
                     let val = env.get_var(name).cloned().unwrap_or(Value::Null);
-                    let mut new_obj = obj.clone();
-                    new_obj.insert(name.clone(), val);
-                    next.push(new_obj);
+                    obj.insert(name.clone(), val);
+                    next.push(obj);
                 }
                 ObjectEntry::ShorthandFormat(name) => {
                     let vals = builtins::apply_format(name, input)?;
-                    for v in &vals {
-                        let mut new_obj = obj.clone();
-                        new_obj.insert(name.clone(), v.clone());
-                        next.push(new_obj);
+                    let mut iter = vals.into_iter().peekable();
+                    while let Some(v) = iter.next() {
+                        if iter.peek().is_none() {
+                            obj.insert(name.clone(), v);
+                            next.push(obj);
+                            break;
+                        } else {
+                            let mut new_obj = obj.clone();
+                            new_obj.insert(name.clone(), v);
+                            next.push(new_obj);
+                        }
                     }
                 }
             }
