@@ -1,4 +1,6 @@
-use qf::query::query;
+use qf::format::Format;
+use qf::parser;
+use qf::query::{jq_parser::Parser, lexer::Lexer, query, CompiledQuery};
 use serde_json::Value;
 
 struct ConformanceCase {
@@ -402,6 +404,307 @@ const CASES: &[ConformanceCase] = &[
         input: r#"{"x":10,"items":[1,2,3]}"#,
         expected: &["[11,12,13]"],
     },
+    // --- Expanded jq.test-derived edge cases (40+ additional cases) ---
+    // reduce
+    ConformanceCase {
+        name: "reduce_empty_array_returns_init",
+        program: "reduce .[] as $x (42; . + $x)",
+        input: "[]",
+        expected: &["42"],
+    },
+    ConformanceCase {
+        name: "reduce_build_object_from_pairs",
+        program: r#"reduce .[] as $item ({}; .[$item[0]] = $item[1])"#,
+        input: r#"[["a", 1], ["b", 2], ["a", 3]]"#,
+        expected: &[r#"{"a":3,"b":2}"#],
+    },
+    // foreach
+    ConformanceCase {
+        name: "foreach_two_arg_running_product",
+        program: "[foreach .[] as $x (1; . * $x)]",
+        input: "[2, 3, 4]",
+        expected: &["[2,6,24]"],
+    },
+    ConformanceCase {
+        name: "foreach_empty_input_yields_nothing",
+        program: "[foreach empty as $x (0; . + 1; .)]",
+        input: "null",
+        expected: &["[]"],
+    },
+    // del
+    ConformanceCase {
+        name: "del_multiple_keys_and_missing_key",
+        program: "del(.a, .c, .missing)",
+        input: r#"{"a":1,"b":2,"c":3}"#,
+        expected: &[r#"{"b":2}"#],
+    },
+    ConformanceCase {
+        name: "del_negative_array_index_and_slice",
+        program: "del(.[-1]), del(.[1:3])",
+        input: "[10, 20, 30, 40]",
+        expected: &["[10,20,30]", "[10,40]"],
+    },
+    // paths
+    ConformanceCase {
+        name: "paths_all_and_leaf_paths",
+        program: "[paths], [leaf_paths]",
+        input: r#"{"a":[1,2],"b":"x"}"#,
+        expected: &[
+            r#"[["a"],["a",0],["a",1],["b"]]"#,
+            r#"[["a",0],["a",1],["b"]]"#,
+        ],
+    },
+    ConformanceCase {
+        name: "paths_filtered_by_type",
+        program: "[paths(strings)]",
+        input: r#"{"a":1,"b":["hi",{"c":"yo"}]}"#,
+        expected: &[r#"[["b",0],["b",1,"c"]]"#],
+    },
+    // getpath / setpath / delpaths
+    ConformanceCase {
+        name: "getpath_nested_and_missing",
+        program: r#"getpath(["a", 1]), getpath(["missing", 0])"#,
+        input: r#"{"a":[10,20]}"#,
+        expected: &["20", "null"],
+    },
+    ConformanceCase {
+        name: "setpath_creates_nested_containers",
+        program: r#"setpath(["a", "b"]; 42), setpath([1]; "x")"#,
+        input: "null",
+        expected: &[r#"{"a":{"b":42}}"#, r#"[null,"x"]"#],
+    },
+    ConformanceCase {
+        name: "delpaths_multiple_paths",
+        program: r#"delpaths([["a"], ["b", 1]])"#,
+        input: r#"{"a":1,"b":[10,20,30]}"#,
+        expected: &[r#"{"b":[10,30]}"#],
+    },
+    // to_entries / from_entries / with_entries
+    ConformanceCase {
+        name: "to_entries_from_entries_empty_object",
+        program: "to_entries, (to_entries | from_entries)",
+        input: "{}",
+        expected: &["[]", "{}"],
+    },
+    ConformanceCase {
+        name: "from_entries_name_and_key_aliases",
+        program: "from_entries",
+        input: r#"[{"name":"a","value":1},{"key":"b","value":2}]"#,
+        expected: &[r#"{"a":1,"b":2}"#],
+    },
+    ConformanceCase {
+        name: "with_entries_filter_keys",
+        program: r#"with_entries(select(.key != "drop"))"#,
+        input: r#"{"keep":1,"drop":2,"also":3}"#,
+        expected: &[r#"{"keep":1,"also":3}"#],
+    },
+    // flatten
+    ConformanceCase {
+        name: "flatten_zero_and_empty",
+        program: "flatten(0), ([] | flatten), ([[]] | flatten)",
+        input: "[1, [2, [3]]]",
+        expected: &["[1,[2,[3]]]", "[]", "[]"],
+    },
+    ConformanceCase {
+        name: "flatten_deep_nested",
+        program: "flatten(2)",
+        input: "[1, [2, [3, [4]]]]",
+        expected: &["[1,2,3,[4]]"],
+    },
+    // range
+    ConformanceCase {
+        name: "range_one_arg_and_empty_bounds",
+        program: "[range(4)], [range(5; 2)], [range(0; 5; -1)]",
+        input: "null",
+        expected: &["[0,1,2,3]", "[]", "[]"],
+    },
+    ConformanceCase {
+        name: "range_negative_step",
+        program: "[range(5; 0; -2)]",
+        input: "null",
+        expected: &["[5,3,1]"],
+    },
+    // limit
+    ConformanceCase {
+        name: "limit_zero_and_subset",
+        program: "[limit(0; range(5))], [limit(3; range(10))]",
+        input: "null",
+        expected: &["[]", "[0,1,2]"],
+    },
+    ConformanceCase {
+        name: "limit_exceeding_generator_length",
+        program: "[limit(10; 1, 2)]",
+        input: "null",
+        expected: &["[1,2]"],
+    },
+    // first / last
+    ConformanceCase {
+        name: "first_and_last_on_generators",
+        program: "first(range(10; 20)), last(range(10; 15))",
+        input: "null",
+        expected: &["10", "14"],
+    },
+    ConformanceCase {
+        name: "first_and_last_on_arrays",
+        program: "first, last",
+        input: "[100, 200, 300]",
+        expected: &["100", "300"],
+    },
+    // while / until
+    ConformanceCase {
+        name: "while_powers_of_two",
+        program: "[while(. < 20; . * 2)]",
+        input: "1",
+        expected: &["[1,2,4,8,16]"],
+    },
+    ConformanceCase {
+        name: "until_converges",
+        program: "until(. >= 100; . * 3)",
+        input: "2",
+        expected: &["162"],
+    },
+    // try / catch
+    ConformanceCase {
+        name: "try_catch_type_error_and_empty",
+        program: r#"(try .foo catch "caught"), (try empty catch "nope")"#,
+        input: "123",
+        expected: &[r#""caught""#],
+    },
+    ConformanceCase {
+        name: "try_without_catch_suppresses_error",
+        program: "[1, (try error(\"x\")), 2]",
+        input: "null",
+        expected: &["[1,2]"],
+    },
+    ConformanceCase {
+        name: "try_catch_nested",
+        program: r#"try (try error("inner") catch ("outer:" + .)) catch ."#,
+        input: "null",
+        expected: &[r#""outer:inner""#],
+    },
+    // label / break
+    ConformanceCase {
+        name: "label_break_nested_labels",
+        program: "[label $outer | (1, 2) | label $inner | if . == 2 then break $outer else . end]",
+        input: "null",
+        expected: &["[1]"],
+    },
+    ConformanceCase {
+        name: "label_break_inside_foreach",
+        program:
+            "[label $stop | foreach .[] as $x (0; . + $x; if . > 5 then break $stop else . end)]",
+        input: "[1, 2, 3, 4]",
+        expected: &["[1,3]"],
+    },
+    // string interpolation
+    ConformanceCase {
+        name: "string_interpolation_expressions",
+        program: r#""name=\(.name), sum=\(1 + 2), arr=\([1,2])""#,
+        input: r#"{"name":"qf"}"#,
+        expected: &[r#""name=qf, sum=3, arr=[1,2]""#],
+    },
+    ConformanceCase {
+        name: "string_interpolation_with_format_filter",
+        program: r#"@html "<p>\(.msg)</p>""#,
+        input: r#"{"msg":"a & b < c"}"#,
+        expected: &[r#""<p>a &amp; b &lt; c</p>""#],
+    },
+    // regex: sub / gsub / match / capture / test / scan
+    ConformanceCase {
+        name: "sub_replaces_only_first_match",
+        program: r#"sub("a"; "X")"#,
+        input: r#""banana""#,
+        expected: &[r#""bXnana""#],
+    },
+    ConformanceCase {
+        name: "gsub_replaces_all_matches",
+        program: r#"gsub("a"; "X")"#,
+        input: r#""banana""#,
+        expected: &[r#""bXnXnX""#],
+    },
+    ConformanceCase {
+        name: "match_returns_offset_length_string_captures",
+        program: r#"match("([a-z]+)-([0-9]+)") | {offset, length, string, caps: [.captures[].string]}"#,
+        input: r#""id: abc-123!""#,
+        expected: &[r#"{"offset":4,"length":7,"string":"abc-123","caps":["abc","123"]}"#],
+    },
+    ConformanceCase {
+        name: "capture_named_groups",
+        program: r#"capture("(?<word>[a-z]+)-(?<num>[0-9]+)")"#,
+        input: r#""foo-42""#,
+        expected: &[r#"{"word":"foo","num":"42"}"#],
+    },
+    ConformanceCase {
+        name: "test_regex_and_flags",
+        program: r#"test("^hello"; "i"), test("^world")"#,
+        input: r#""Hello there""#,
+        expected: &["true", "false"],
+    },
+    ConformanceCase {
+        name: "scan_regex_matches",
+        program: r#"scan("[0-9]+")"#,
+        input: r#""a1b22c333""#,
+        expected: &[r#"["1","22","333"]"#],
+    },
+];
+
+struct ErrorCase {
+    name: &'static str,
+    program: &'static str,
+    input: &'static str,
+}
+
+const ERROR_CASES: &[ErrorCase] = &[
+    ErrorCase {
+        name: "err_division_by_zero",
+        program: "1 / 0",
+        input: "null",
+    },
+    ErrorCase {
+        name: "err_explicit_error_builtin",
+        program: r#"error("boom")"#,
+        input: "null",
+    },
+    ErrorCase {
+        name: "err_field_access_on_number",
+        program: ".a",
+        input: "42",
+    },
+    ErrorCase {
+        name: "err_index_on_string",
+        program: ".[0]",
+        input: r#""hello""#,
+    },
+    ErrorCase {
+        name: "err_add_number_and_string",
+        program: r#"1 + "a""#,
+        input: "null",
+    },
+    ErrorCase {
+        name: "err_keys_on_number",
+        program: "keys",
+        input: "42",
+    },
+    ErrorCase {
+        name: "err_fromjson_malformed",
+        program: "fromjson",
+        input: r#""{bad json""#,
+    },
+    ErrorCase {
+        name: "err_slice_on_number",
+        program: ".[1:2]",
+        input: "42",
+    },
+    ErrorCase {
+        name: "err_syntax_trailing_operator",
+        program: ".a +",
+        input: "{}",
+    },
+    ErrorCase {
+        name: "err_undeclared_break_label",
+        program: "break $missing",
+        input: "null",
+    },
 ];
 
 #[test]
@@ -444,4 +747,159 @@ fn jq_conformance_preserves_object_key_order_on_serialize() {
         serde_json::to_string(&results[0]).unwrap(),
         r#"{"z":1,"a":2,"m":3,"extra":4}"#
     );
+}
+
+#[test]
+fn jq_conformance_error_cases() {
+    assert!(
+        CASES.len() + ERROR_CASES.len() >= 90,
+        "expected at least 90 total conformance cases"
+    );
+    for case in ERROR_CASES {
+        let input: Value = serde_json::from_str(case.input)
+            .unwrap_or_else(|e| panic!("[{}] invalid input JSON: {e}", case.name));
+        let res = query(&input, case.program);
+        assert!(
+            res.is_err(),
+            "[{}] expected error for program `{}` on input `{}`, got {:?}",
+            case.name,
+            case.program,
+            case.input,
+            res
+        );
+    }
+}
+
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_usize(&mut self, bound: usize) -> usize {
+        (self.next_u64() as usize) % bound
+    }
+}
+
+#[test]
+fn fuzz_corpus_and_prng_zero_panics() {
+    const MALFORMED_CORPUS: &[&str] = &[
+        "",
+        "   \t\n\r  ",
+        ".",
+        "..",
+        "...",
+        ".a.",
+        ".[]]",
+        "[[[[[[[[[[[[[[[[",
+        "]]]]]]]]]]]]]]]]",
+        "{{{{{{{{{{{{{{{{",
+        "}}}}}}}}}}}}}}}}",
+        "((((((((((((((((",
+        "))))))))))))))))",
+        "\"unterminated string",
+        "\"unterminated \\",
+        "\"bad escape \\u12\"",
+        "\"interp \\(.a\"",
+        "\"interp \\(1 + )\"",
+        "@unknown \"hi\"",
+        "@base64 \"\\(",
+        "if true then 1",
+        "if true then 1 else",
+        "if true then 1 elif",
+        "reduce .[] as $x (",
+        "foreach .[] as $x (0; .)",
+        "def f(",
+        "def f(a; b): ;",
+        "try",
+        "try 1 catch",
+        "label $x",
+        "break $x",
+        "1e999999999999999999999999",
+        "-0.0e+",
+        "0x1234",
+        "\0\0\0",
+        "🦀\"\\(.)\"🚀",
+        "<?xml version=\"1.0\"?><root><unclosed>",
+        "<root attr=\"unclosed><child/></root>",
+        "---\n- : :\n  [unclosed",
+        "%YAML 1.2\n---\n*undefined_alias",
+        "[section\nkey = \"unclosed",
+        "a = [1, 2, 3,\n",
+        "col1,col2\n\"unclosed,quote\n1,2,3,4,5",
+        "a\tb\n\"x\ty\tz",
+    ];
+
+    const JQ_TOKENS: &[&str] = &[
+        ".", "..", "[]", "|", ",", ";", ":", "=", "|=", "+=", "//", "and", "or", "not", "if",
+        "then", "elif", "else", "end", "as", "$x", "try", "catch", "reduce", "foreach", "label",
+        "break", "def", "empty", "null", "true", "false", "123", "\"str\"", "\\(.a)", "(", ")",
+        "[", "]", "{", "}", "+", "-", "*", "/", "%", "==", "!=", "<", ">", "?", "@json", "<", ">",
+        "=", "\n", "\t", " ", "🦀",
+    ];
+
+    let mut inputs: Vec<String> = MALFORMED_CORPUS.iter().map(|s| (*s).to_string()).collect();
+
+    let mut rng = Xorshift64(0x5eed_cafe_babe_1234);
+    // 150 pseudo-random JQ-token-soup strings
+    for _ in 0..150 {
+        let len = 1 + rng.next_usize(18);
+        let mut s = String::new();
+        for _ in 0..len {
+            s.push_str(JQ_TOKENS[rng.next_usize(JQ_TOKENS.len())]);
+            if rng.next_usize(3) == 0 {
+                s.push(' ');
+            }
+        }
+        inputs.push(s);
+    }
+
+    // 100 pseudo-random printable/UTF-8 byte-soup strings
+    let charset: Vec<char> = (0x20u8..=0x7eu8)
+        .map(char::from)
+        .chain(['\n', '\t', '\0', 'é', '🦀', '中'])
+        .collect();
+    for _ in 0..100 {
+        let len = 1 + rng.next_usize(48);
+        let mut s = String::with_capacity(len);
+        for _ in 0..len {
+            s.push(charset[rng.next_usize(charset.len())]);
+        }
+        inputs.push(s);
+    }
+
+    assert!(inputs.len() >= 250);
+
+    let fixture = serde_json::json!({
+        "a": [1, 2, 3],
+        "b": {"c": "hello", "d": true, "e": null}
+    });
+
+    for s in &inputs {
+        let mut lex = Lexer::new(s);
+        if lex.tokenize().is_ok() {
+            let mut parser = Parser::new(lex.tokens);
+            let _ = parser.parse();
+        }
+        let _ = CompiledQuery::compile(s);
+        let _ = query(&fixture, s);
+
+        for fmt in [
+            Format::Json,
+            Format::Yaml,
+            Format::Xml,
+            Format::Toml,
+            Format::Csv,
+            Format::Tsv,
+        ] {
+            let _ = parser::parse(s, fmt);
+        }
+        let _ = Format::detect_from_content(s);
+    }
 }
