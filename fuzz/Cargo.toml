@@ -1,0 +1,37 @@
+[package]
+name = "qf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.qf]
+path = ".."
+
+[[bin]]
+name = "fuzz_lexer_parser"
+path = "fuzz_targets/fuzz_lexer_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_query"
+path = "fuzz_targets/fuzz_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_formats"
+path = "fuzz_targets/fuzz_formats.rs"
+test = false
+doc = false
+bench = false
