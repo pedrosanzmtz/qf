@@ -16,10 +16,7 @@ impl Parser {
     pub fn parse(&mut self) -> Result<Expr, QfError> {
         let expr = self.parse_pipe()?;
         if !self.at_eof() {
-            return Err(self.error(format!(
-                "unexpected token: {:?}",
-                self.current()
-            )));
+            return Err(self.error(format!("unexpected token: {:?}", self.current())));
         }
         Ok(expr)
     }
@@ -47,11 +44,7 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(self.error(format!(
-                "expected {:?}, got {:?}",
-                expected,
-                self.current()
-            )))
+            Err(self.error(format!("expected {:?}, got {:?}", expected, self.current())))
         }
     }
 
@@ -297,15 +290,9 @@ impl Parser {
                         };
                         if matches!(self.current(), Token::Question) {
                             self.advance();
-                            expr = Expr::Pipe(
-                                Box::new(expr),
-                                Box::new(Expr::OptionalField(name)),
-                            );
+                            expr = Expr::Pipe(Box::new(expr), Box::new(Expr::OptionalField(name)));
                         } else {
-                            expr = Expr::Pipe(
-                                Box::new(expr),
-                                Box::new(Expr::Field(name)),
-                            );
+                            expr = Expr::Pipe(Box::new(expr), Box::new(Expr::Field(name)));
                         }
                     } else {
                         break;
@@ -453,12 +440,8 @@ impl Parser {
                     Ok(Expr::ArrayConstruct(Box::new(inner)))
                 }
             }
-            Token::LBrace => {
-                self.parse_object_construct()
-            }
-            Token::If => {
-                self.parse_if()
-            }
+            Token::LBrace => self.parse_object_construct(),
+            Token::If => self.parse_if(),
             Token::Try => {
                 self.advance();
                 let expr = self.parse_postfix()?;
@@ -470,12 +453,8 @@ impl Parser {
                 };
                 Ok(Expr::Try(Box::new(expr), catch))
             }
-            Token::Reduce => {
-                self.parse_reduce()
-            }
-            Token::Foreach => {
-                self.parse_foreach()
-            }
+            Token::Reduce => self.parse_reduce(),
+            Token::Foreach => self.parse_foreach(),
             Token::Not => {
                 self.advance();
                 // `not` in jq is a postfix/function, but can appear as prefix in some contexts
@@ -577,10 +556,7 @@ impl Parser {
                 if matches!(self.current(), Token::Colon) {
                     self.advance();
                     let value = self.parse_pipe_no_comma()?;
-                    Ok(ObjectEntry::ComputedKeyValue(
-                        Expr::VarRef(name),
-                        value,
-                    ))
+                    Ok(ObjectEntry::ComputedKeyValue(Expr::VarRef(name), value))
                 } else {
                     Ok(ObjectEntry::ShorthandVar(name))
                 }
@@ -605,16 +581,10 @@ impl Parser {
                     let value = self.parse_pipe_no_comma()?;
                     Ok(ObjectEntry::ComputedKeyValue(key_expr, value))
                 } else {
-                    Ok(ObjectEntry::ComputedKeyValue(
-                        key_expr.clone(),
-                        key_expr,
-                    ))
+                    Ok(ObjectEntry::ComputedKeyValue(key_expr.clone(), key_expr))
                 }
             }
-            _ => Err(self.error(format!(
-                "expected object key, got {:?}",
-                self.current()
-            ))),
+            _ => Err(self.error(format!("expected object key, got {:?}", self.current()))),
         }
     }
 
@@ -706,9 +676,7 @@ impl Parser {
                 match self.advance() {
                     Token::Ident(p) => params.push(p),
                     other => {
-                        return Err(
-                            self.error(format!("expected parameter name, got {:?}", other))
-                        )
+                        return Err(self.error(format!("expected parameter name, got {:?}", other)))
                     }
                 }
                 while matches!(self.current(), Token::Semicolon) {
@@ -743,7 +711,9 @@ impl Parser {
         self.advance(); // skip 'label'
         let name = match self.advance() {
             Token::Variable(name) => name,
-            other => return Err(self.error(format!("expected $variable after 'label', got {:?}", other))),
+            other => {
+                return Err(self.error(format!("expected $variable after 'label', got {:?}", other)))
+            }
         };
         self.expect(&Token::Pipe)?;
         let body = self.parse_pipe()?;
@@ -944,14 +914,8 @@ mod tests {
         assert_eq!(
             expr,
             Expr::ObjectConstruct(vec![
-                ObjectEntry::KeyValue(
-                    ObjectKey::Ident("name".into()),
-                    Expr::Field("foo".into()),
-                ),
-                ObjectEntry::KeyValue(
-                    ObjectKey::Ident("value".into()),
-                    Expr::Field("bar".into()),
-                ),
+                ObjectEntry::KeyValue(ObjectKey::Ident("name".into()), Expr::Field("foo".into()),),
+                ObjectEntry::KeyValue(ObjectKey::Ident("value".into()), Expr::Field("bar".into()),),
             ])
         );
     }
@@ -1003,7 +967,11 @@ mod tests {
             )
         );
 
-        let res = crate::query::query(&serde_json::Value::Null, "label $out | (1, 2, break $out, 3)").unwrap();
+        let res = crate::query::query(
+            &serde_json::Value::Null,
+            "label $out | (1, 2, break $out, 3)",
+        )
+        .unwrap();
         assert_eq!(res, vec![serde_json::json!(1), serde_json::json!(2)]);
     }
 
