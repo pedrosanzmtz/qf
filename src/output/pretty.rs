@@ -59,7 +59,7 @@ fn format_json(value: &Value, compact: bool) -> Result<String, QfError> {
 }
 
 fn format_yaml(value: &Value) -> Result<String, QfError> {
-    serde_yaml::to_string(value).map_err(|e| QfError::Parse(e.to_string()))
+    serde_yaml_ng::to_string(value).map_err(|e| QfError::Parse(e.to_string()))
 }
 
 fn format_xml(value: &Value) -> Result<String, QfError> {
