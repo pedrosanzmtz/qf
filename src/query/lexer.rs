@@ -102,6 +102,7 @@ impl Token {
             "import" => Some(Token::Import),
             "include" => Some(Token::Include),
             "label" => Some(Token::Label),
+            "break" => Some(Token::Break),
             "true" => Some(Token::True),
             "false" => Some(Token::False),
             "null" => Some(Token::Null),
@@ -380,6 +381,18 @@ impl Lexer {
     }
 
     fn read_string(&mut self) -> Result<(), QfError> {
+        // If immediately preceded by @format, apply @format to each \(...) interpolation
+        let format_name = if matches!(self.tokens.last(), Some(Token::Format(_))) {
+            match self.tokens.pop() {
+                Some(Token::Format(name)) => Some(name),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let start_token_idx = self.tokens.len();
+        let mut has_interp = false;
+
         self.pos += 1; // skip opening quote
         let mut s = String::new();
         while self.pos < self.input.len() {
@@ -387,6 +400,9 @@ impl Lexer {
                 '"' => {
                     self.pos += 1;
                     self.tokens.push(Token::String(s));
+                    if has_interp {
+                        self.tokens.push(Token::RParen);
+                    }
                     return Ok(());
                 }
                 '\\' => {
@@ -408,12 +424,16 @@ impl Lexer {
                             // String interpolation: \(expr)
                             // We emit the accumulated string, then a special sequence
                             // We handle this by emitting tokens inline
+                            if !has_interp {
+                                has_interp = true;
+                                self.tokens.insert(start_token_idx, Token::LParen);
+                            }
                             self.tokens.push(Token::String(std::mem::take(&mut s)));
                             self.tokens.push(Token::Plus);
                             self.pos += 1; // skip '('
 
                             // We need to lex until matching ')' and emit those tokens
-                            // wrapped in tostring
+                            // wrapped in tostring (or @format if preceded by @format)
                             self.tokens.push(Token::LParen);
                             let mut depth = 1;
                             let interp_start = self.pos;
@@ -436,10 +456,14 @@ impl Lexer {
                             if let Some(Token::Eof) = sub_lexer.tokens.last() {
                                 sub_lexer.tokens.pop();
                             }
-                            // Add pipe to tostring before closing
+                            // Add pipe to @format or tostring before closing
                             self.tokens.extend(sub_lexer.tokens);
                             self.tokens.push(Token::Pipe);
-                            self.tokens.push(Token::Ident("tostring".into()));
+                            if let Some(ref fmt) = format_name {
+                                self.tokens.push(Token::Format(fmt.clone()));
+                            } else {
+                                self.tokens.push(Token::Ident("tostring".into()));
+                            }
                             self.tokens.push(Token::RParen);
                             self.tokens.push(Token::Plus);
 
