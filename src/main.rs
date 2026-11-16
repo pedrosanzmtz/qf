@@ -413,7 +413,7 @@ fn run_in_place(cli: &Cli, query_str: &str, base_opts: &FormatOpts) -> Result<i3
         let values = parse_values(&content, in_fmt)?;
         let mut results = Vec::new();
         if cli.slurp {
-            results.extend(query::query(&Value::Array(values), query_str)?);
+            results.extend(query::query(&Value::Array(values.clone()), query_str)?);
         } else {
             for val in &values {
                 results.extend(query::query(val, query_str)?);
@@ -436,7 +436,11 @@ fn run_in_place(cli: &Cli, query_str: &str, base_opts: &FormatOpts) -> Result<i3
 
         let mut file_opts = base_opts.clone();
         file_opts.colorize = false;
-        let mut formatted = format_single_value(&result, in_fmt, &file_opts)?;
+        let mut formatted = if in_fmt == Format::Toml && values.len() == 1 && !base_opts.sort_keys {
+            output::preserve::apply_toml_diff(&content, &values[0], &result)?
+        } else {
+            format_single_value(&result, in_fmt, &file_opts)?
+        };
         if !formatted.ends_with('\n') && !file_opts.join_output {
             formatted.push('\n');
         }
@@ -751,14 +755,18 @@ fn build_query_with_args(
 ) -> Result<String, CliError> {
     let mut prefix = String::new();
 
-    for [name, val] in args.as_chunks::<2>().0 {
+    for pair in args.chunks_exact(2) {
+        let name = &pair[0];
+        let val = &pair[1];
         validate_var_name(name)?;
         let json_lit = serde_json::to_string(&Value::String(val.clone()))
             .map_err(|e| CliError::usage(format!("encoding --arg {name}: {e}")))?;
         prefix.push_str(&format!("{json_lit} as ${name} | "));
     }
 
-    for [name, raw_json] in argjsons.as_chunks::<2>().0 {
+    for pair in argjsons.chunks_exact(2) {
+        let name = &pair[0];
+        let raw_json = &pair[1];
         validate_var_name(name)?;
         let parsed: Value = serde_json::from_str(raw_json)
             .map_err(|e| CliError::usage(format!("invalid JSON for --argjson {name}: {e}")))?;

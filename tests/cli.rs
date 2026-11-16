@@ -394,3 +394,37 @@ fn preserves_object_key_order() {
         .success()
         .stdout("[\"a\",\"b\"]\n");
 }
+
+#[test]
+fn in_place_toml_preserves_comments_and_formatting() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = dir.path().join("Cargo.toml");
+    let original = "\
+# Package manifest
+[package]
+name = \"demo\" # package name
+version = \"0.1.0\"
+
+# Untouched array formatting
+authors = [ 'Alice', 'Bob' ]
+";
+    std::fs::write(&toml_path, original).unwrap();
+
+    cargo_bin_cmd!("qf")
+        .args(["-i", r#".package.version = "0.2.0""#])
+        .arg(&toml_path)
+        .assert()
+        .success();
+
+    let updated = std::fs::read_to_string(&toml_path).unwrap();
+    let expected = "\
+# Package manifest
+[package]
+name = \"demo\" # package name
+version = \"0.2.0\"
+
+# Untouched array formatting
+authors = [ 'Alice', 'Bob' ]
+";
+    assert_eq!(updated, expected);
+}
