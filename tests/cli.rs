@@ -323,3 +323,50 @@ fn error_ux_and_jq_exit_codes() {
         .code(5)
         .stderr(predicate::str::starts_with("qf: error: "));
 }
+
+#[test]
+fn color_output_compact_no_color_and_jq_colors() {
+    // Compact JSON with --color always produces single-line ANSI-colored output
+    cargo_bin_cmd!("qf")
+        .args(["-c", "--color", "always", "-n", "{a: 1}"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\x1b[1;34m\"a\"\x1b[0m:\x1b[0;36m1\x1b[0m",
+        ))
+        .stdout(predicate::str::contains(": ").not());
+
+    // NO_COLOR="" with --color always still outputs color
+    cargo_bin_cmd!("qf")
+        .env("NO_COLOR", "")
+        .args(["--color", "always", "-n", "{a: 1}"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1b["));
+
+    // Explicit --color always takes precedence over non-empty NO_COLOR
+    cargo_bin_cmd!("qf")
+        .env("NO_COLOR", "1")
+        .args(["--color", "always", "-n", "{a: 1}"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1b["));
+
+    // --color never disables color even with NO_COLOR unset
+    cargo_bin_cmd!("qf")
+        .env_remove("NO_COLOR")
+        .args(["--color", "never", "-n", "{a: 1}"])
+        .assert()
+        .success()
+        .stdout("{\n  \"a\": 1\n}\n");
+
+    // JQ_COLORS customizes ANSI SGR codes
+    cargo_bin_cmd!("qf")
+        .env("JQ_COLORS", "90:31:32:33:34:35:36:37")
+        .args(["-c", "--color", "always", "-n", "{a: 1}"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\x1b[37m\"a\"\x1b[0m:\x1b[33m1\x1b[0m",
+        ));
+}

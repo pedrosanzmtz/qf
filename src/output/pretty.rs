@@ -28,9 +28,9 @@ pub fn format_value_colored(
         }
     }
 
-    if colorize && !compact {
+    if colorize {
         match format {
-            Format::Json => return Ok(super::color::colorize_json(value)),
+            Format::Json => return Ok(super::color::colorize_json_with_options(value, compact)),
             Format::Yaml => {
                 let yaml = format_yaml(value)?;
                 return Ok(super::color::colorize_yaml(&yaml));
