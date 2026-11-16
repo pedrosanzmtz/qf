@@ -296,4 +296,25 @@ mod tests {
             vec![json!(false)]
         );
     }
+
+    #[test]
+    fn query_preserves_object_key_order() {
+        let val: Value = serde_json::from_str(r#"{"b":1,"a":2}"#).unwrap();
+        assert_eq!(serde_json::to_string(&val).unwrap(), r#"{"b":1,"a":2}"#);
+        assert_eq!(
+            query(&val, "keys_unsorted").unwrap(),
+            vec![json!(["b", "a"])]
+        );
+        assert_eq!(query(&val, "keys").unwrap(), vec![json!(["a", "b"])]);
+        assert_eq!(
+            query(&val, "tojson").unwrap(),
+            vec![json!(r#"{"b":1,"a":2}"#)]
+        );
+
+        let constructed = query(&json!(null), "{b: 1, a: 2}").unwrap();
+        assert_eq!(
+            serde_json::to_string(&constructed[0]).unwrap(),
+            r#"{"b":1,"a":2}"#
+        );
+    }
 }

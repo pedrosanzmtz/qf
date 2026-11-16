@@ -323,3 +323,27 @@ fn error_ux_and_jq_exit_codes() {
         .code(5)
         .stderr(predicate::str::starts_with("qf: error: "));
 }
+
+#[test]
+fn preserves_object_key_order() {
+    cargo_bin_cmd!("qf")
+        .args(["-c", "."])
+        .write_stdin(r#"{"b":1,"a":2}"#)
+        .assert()
+        .success()
+        .stdout("{\"b\":1,\"a\":2}\n");
+
+    cargo_bin_cmd!("qf")
+        .args(["-c", "keys_unsorted"])
+        .write_stdin(r#"{"b":1,"a":2}"#)
+        .assert()
+        .success()
+        .stdout("[\"b\",\"a\"]\n");
+
+    cargo_bin_cmd!("qf")
+        .args(["-c", "keys"])
+        .write_stdin(r#"{"b":1,"a":2}"#)
+        .assert()
+        .success()
+        .stdout("[\"a\",\"b\"]\n");
+}
