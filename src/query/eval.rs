@@ -43,8 +43,7 @@ impl EvalError {
                     | QfError::Runtime(s)
                     | QfError::UserError(s)
                     | QfError::Parse(s)
-                    | QfError::InvalidQuery(s)
-                    | QfError::PathNotFound(s) => s.clone(),
+                    | QfError::Serialize(s) => s.clone(),
                     other => other.to_string(),
                 };
                 Some(Value::String(msg))
