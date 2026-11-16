@@ -588,10 +588,14 @@ pub fn is_truthy(v: &Value) -> bool {
     !matches!(v, Value::Null | Value::Bool(false))
 }
 
-fn json_f64(f: f64) -> Value {
-    serde_json::Number::from_f64(f)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
+pub(crate) fn json_f64(f: f64) -> Value {
+    if f.fract() == 0.0 && f.is_finite() && f >= i64::MIN as f64 && f < -(i64::MIN as f64) {
+        Value::Number((f as i64).into())
+    } else {
+        serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    }
 }
 
 fn index_value(val: &Value, idx: &Value) -> Result<Value, QfError> {
@@ -802,17 +806,7 @@ fn arith_op(left: &Value, right: &Value, f: impl Fn(f64, f64) -> f64) -> Result<
         (Value::Number(a), Value::Number(b)) => {
             let af = a.as_f64().unwrap_or(0.0);
             let bf = b.as_f64().unwrap_or(0.0);
-            let result = f(af, bf);
-            // Keep integer if both were integers and result fits
-            if a.is_i64()
-                && b.is_i64()
-                && result.fract() == 0.0
-                && result >= i64::MIN as f64
-                && result <= i64::MAX as f64
-            {
-                return Ok(Value::Number((result as i64).into()));
-            }
-            Ok(json_f64(result))
+            Ok(json_f64(f(af, bf)))
         }
         _ => Err(QfError::TypeError(format!(
             "cannot perform arithmetic on {} and {}",
@@ -880,7 +874,24 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             }
             a.len().cmp(&b.len())
         }
-        (Value::Object(_), Value::Object(_)) => std::cmp::Ordering::Equal,
+        (Value::Object(a), Value::Object(b)) => {
+            let mut ka: Vec<&String> = a.keys().collect();
+            let mut kb: Vec<&String> = b.keys().collect();
+            ka.sort();
+            kb.sort();
+            match ka.cmp(&kb) {
+                std::cmp::Ordering::Equal => {
+                    for k in ka {
+                        let c = compare_values(&a[k], &b[k]);
+                        if c != std::cmp::Ordering::Equal {
+                            return c;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                }
+                ord => ord,
+            }
+        }
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -2399,5 +2410,63 @@ mod tests {
             vec![json!([1, 2, 3, 4, 5])]
         );
         assert_eq!(eval_expr("1", "first(recurse(. + 1))"), vec![json!(1)]);
+    }
+
+    // ── #21 & #22: Object comparison & Number fidelity ─────────
+    #[test]
+    fn eval_object_comparison_and_sort() {
+        assert_eq!(eval_expr("null", "{} < {\"a\": 1}"), vec![json!(true)]);
+        assert_eq!(eval_expr("null", "{\"a\": 1} < {}"), vec![json!(false)]);
+        assert_eq!(
+            eval_expr("null", "{\"a\": 1} < {\"b\": 0}"),
+            vec![json!(true)]
+        );
+        assert_eq!(
+            eval_expr("null", "{\"a\": 1} < {\"a\": 2}"),
+            vec![json!(true)]
+        );
+        assert_eq!(
+            eval_expr("null", "{\"b\": 1, \"a\": 2} == {\"a\": 2, \"b\": 1}"),
+            vec![json!(true)]
+        );
+        assert_eq!(
+            eval_expr(r#"[{"b":1},{"a":2},{}]"#, "sort"),
+            vec![json!([{}, {"a": 2}, {"b": 1}])]
+        );
+    }
+
+    #[test]
+    fn eval_integral_float_normalization() {
+        let sum = eval_expr("null", "1.5 + 2.5");
+        assert_eq!(sum, vec![json!(4)]);
+        assert!(sum[0].is_i64());
+
+        let big = eval_expr("null", "67499775000.0 + 0.0");
+        assert_eq!(big, vec![json!(67499775000_i64)]);
+        assert!(big[0].is_i64());
+
+        let added = eval_expr("[1.5, 2.5]", "add");
+        assert_eq!(added, vec![json!(4)]);
+        assert!(added[0].is_i64());
+
+        let prod = eval_expr("null", "2.5 * 4.0");
+        assert_eq!(prod, vec![json!(10)]);
+        assert!(prod[0].is_i64());
+
+        let quot = eval_expr("null", "6.0 / 2.0");
+        assert_eq!(quot, vec![json!(3)]);
+        assert!(quot[0].is_i64());
+
+        let diff = eval_expr("null", "10.0 - 3.0");
+        assert_eq!(diff, vec![json!(7)]);
+        assert!(diff[0].is_i64());
+
+        let neg = eval_expr("-5.0", "-.");
+        assert_eq!(neg, vec![json!(5)]);
+        assert!(neg[0].is_i64());
+
+        // Non-integral floats remain floats
+        let frac = eval_expr("null", "1.5 + 2.25");
+        assert_eq!(frac, vec![json!(3.75)]);
     }
 }

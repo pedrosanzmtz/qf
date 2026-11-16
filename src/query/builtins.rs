@@ -7,8 +7,9 @@ use crate::error::QfError;
 use super::ast::Expr;
 use super::env::Env;
 use super::eval::{
-    collect_paths, delete_path_segments, eval_inner, eval_stream, is_truthy,
-    path_segments_to_value, sort_paths_for_deletion, value_type, EvalError, PathSegment,
+    collect_paths, delete_path_segments, eval_inner, eval_stream, is_truthy, json_f64,
+    path_segments_to_value, set_path_pub, sort_paths_for_deletion, value_type, EvalError,
+    PathSegment,
 };
 
 pub fn call_builtin(
@@ -140,6 +141,68 @@ pub(crate) fn call_builtin_stream(
         ("recurse", 1) => eval_recurse_stream(&args[0], input, env, emit),
         ("while", 2) => eval_while_stream(&args[0], &args[1], input, env, emit),
         ("repeat", 1) => eval_recurse_stream(&args[0], input, env, emit),
+        ("any", 2) => {
+            let mut found = false;
+            eval_stream(&args[0], input, env, &mut |item| {
+                let mut inner_cont = true;
+                eval_stream(&args[1], &item, env, &mut |cond| {
+                    if is_truthy(&cond) {
+                        found = true;
+                        inner_cont = false;
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                })?;
+                Ok(inner_cont)
+            })?;
+            emit(Value::Bool(found))
+        }
+        ("all", 2) => {
+            let mut all_true = true;
+            eval_stream(&args[0], input, env, &mut |item| {
+                let mut inner_cont = true;
+                eval_stream(&args[1], &item, env, &mut |cond| {
+                    if !is_truthy(&cond) {
+                        all_true = false;
+                        inner_cont = false;
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                })?;
+                Ok(inner_cont)
+            })?;
+            emit(Value::Bool(all_true))
+        }
+        ("isempty", 1) => {
+            let mut is_empty = true;
+            eval_stream(&args[0], input, env, &mut |_| {
+                is_empty = false;
+                Ok(false)
+            })?;
+            emit(Value::Bool(is_empty))
+        }
+        ("IN", 1) => {
+            let mut found = false;
+            eval_stream(&args[0], input, env, &mut |v| {
+                if *input == v {
+                    found = true;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            })?;
+            emit(Value::Bool(found))
+        }
+        ("nth", 2) => eval_nth_stream(&args[0], &args[1], input, env, emit),
+        ("splits", 1) | ("splits", 2) => eval_splits_stream(args, input, env, emit),
+        ("walk", 1) => eval_walk_stream(&args[0], input, env, emit),
+        ("tostream", 0) => {
+            let mut path = Vec::new();
+            emit_tostream(input, &mut path, emit)
+        }
+        ("fromstream", 1) => eval_fromstream(&args[0], input, env, emit),
         _ => {
             let vals = call_builtin_vec(name, args, input, env)?;
             for v in vals {
@@ -190,6 +253,245 @@ fn eval_while_stream(
     Ok(true)
 }
 
+fn eval_nth_stream(
+    n_expr: &Expr,
+    gen_expr: &Expr,
+    input: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    eval_stream(n_expr, input, env, &mut |n_val| {
+        let target = match n_val {
+            Value::Number(n) => n
+                .as_i64()
+                .unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
+            _ => {
+                return Err(EvalError::Qf(QfError::TypeError(
+                    "nth index must be a number".into(),
+                )))
+            }
+        };
+        if target < 0 {
+            return Err(EvalError::Qf(QfError::Runtime(
+                "nth doesn't support negative indices".into(),
+            )));
+        }
+        let mut idx = 0i64;
+        let mut outer_cont = true;
+        eval_stream(gen_expr, input, env, &mut |v| {
+            if idx == target {
+                outer_cont = emit(v)?;
+                Ok(false)
+            } else {
+                idx += 1;
+                Ok(true)
+            }
+        })?;
+        Ok(outer_cont)
+    })
+}
+
+fn eval_splits_stream(
+    args: &[Expr],
+    input: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    let s = match input {
+        Value::String(s) => s.as_str(),
+        _ => {
+            return Err(EvalError::Qf(QfError::TypeError(
+                "splits requires string input".into(),
+            )))
+        }
+    };
+    let patterns = eval_inner(&args[0], input, env)?;
+    let flags_list = if args.len() > 1 {
+        eval_inner(&args[1], input, env)?
+            .into_iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for pattern in &patterns {
+        let p = pattern.as_str().ok_or_else(|| {
+            EvalError::Qf(QfError::TypeError("splits pattern must be string".into()))
+        })?;
+        for flags in &flags_list {
+            let re = build_regex(p, flags)?;
+            for part in re.split(s) {
+                if !emit(Value::String(part.to_string()))? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn eval_walk_stream(
+    f: &Expr,
+    val: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    match val {
+        Value::Array(arr) => {
+            let mut new_arr = Vec::with_capacity(arr.len());
+            for item in arr {
+                eval_walk_stream(f, item, env, &mut |v| {
+                    new_arr.push(v);
+                    Ok(true)
+                })?;
+            }
+            eval_stream(f, &Value::Array(new_arr), env, emit)
+        }
+        Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+            for (k, v) in map {
+                let mut walked = None;
+                eval_walk_stream(f, v, env, &mut |wv| {
+                    walked = Some(wv);
+                    Ok(false)
+                })?;
+                if let Some(wv) = walked {
+                    new_map.insert(k.clone(), wv);
+                }
+            }
+            eval_stream(f, &Value::Object(new_map), env, emit)
+        }
+        _ => eval_stream(f, val, env, emit),
+    }
+}
+
+fn emit_tostream(
+    val: &Value,
+    path: &mut Vec<Value>,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    match val {
+        Value::Array(arr) if !arr.is_empty() => {
+            for (i, item) in arr.iter().enumerate() {
+                path.push(Value::Number(i.into()));
+                if !emit_tostream(item, path, emit)? {
+                    path.pop();
+                    return Ok(false);
+                }
+                path.pop();
+            }
+            path.push(Value::Number((arr.len() - 1).into()));
+            let cont = emit(Value::Array(vec![Value::Array(path.clone())]))?;
+            path.pop();
+            Ok(cont)
+        }
+        Value::Object(map) if !map.is_empty() => {
+            let mut last_key = None;
+            for (k, v) in map {
+                path.push(Value::String(k.clone()));
+                if !emit_tostream(v, path, emit)? {
+                    path.pop();
+                    return Ok(false);
+                }
+                path.pop();
+                last_key = Some(k);
+            }
+            if let Some(lk) = last_key {
+                path.push(Value::String(lk.clone()));
+                let cont = emit(Value::Array(vec![Value::Array(path.clone())]))?;
+                path.pop();
+                Ok(cont)
+            } else {
+                Ok(true)
+            }
+        }
+        _ => emit(Value::Array(vec![Value::Array(path.clone()), val.clone()])),
+    }
+}
+
+fn value_to_path_segments(path: &[Value]) -> Result<Vec<PathSegment>, EvalError> {
+    path.iter()
+        .map(|seg| match seg {
+            Value::String(s) => Ok(PathSegment::Key(s.clone())),
+            Value::Number(n) => {
+                let i = n.as_i64().ok_or_else(|| {
+                    EvalError::Qf(QfError::TypeError(
+                        "stream path index must be integer".into(),
+                    ))
+                })?;
+                Ok(PathSegment::Index(i))
+            }
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "stream path segment must be string or number".into(),
+            ))),
+        })
+        .collect()
+}
+
+fn eval_fromstream(
+    expr: &Expr,
+    input: &Value,
+    env: &Env,
+    emit: &mut dyn FnMut(Value) -> Result<bool, EvalError>,
+) -> Result<bool, EvalError> {
+    let mut acc: Option<Value> = None;
+    let mut outer_cont = true;
+    eval_stream(expr, input, env, &mut |item| {
+        let arr = match item {
+            Value::Array(a) => a,
+            _ => {
+                return Err(EvalError::Qf(QfError::TypeError(
+                    "fromstream requires [path] or [path, value] arrays".into(),
+                )))
+            }
+        };
+        match arr.len() {
+            2 => {
+                let path = match &arr[0] {
+                    Value::Array(p) => p,
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "fromstream path must be an array".into(),
+                        )))
+                    }
+                };
+                let val = arr[1].clone();
+                if path.is_empty() {
+                    acc = None;
+                    outer_cont = emit(val)?;
+                    Ok(outer_cont)
+                } else {
+                    let segments = value_to_path_segments(path)?;
+                    let base = acc.take().unwrap_or(Value::Null);
+                    acc = Some(set_path_pub(&base, &segments, val)?);
+                    Ok(true)
+                }
+            }
+            1 => {
+                let path = match &arr[0] {
+                    Value::Array(p) => p,
+                    _ => {
+                        return Err(EvalError::Qf(QfError::TypeError(
+                            "fromstream path must be an array".into(),
+                        )))
+                    }
+                };
+                if path.len() <= 1 {
+                    if let Some(completed) = acc.take() {
+                        outer_cont = emit(completed)?;
+                        return Ok(outer_cont);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Err(EvalError::Qf(QfError::TypeError(
+                "fromstream requires [path] or [path, value] arrays".into(),
+            ))),
+        }
+    })?;
+    Ok(outer_cont)
+}
+
 fn call_builtin_vec(
     name: &str,
     args: &[Expr],
@@ -204,14 +506,53 @@ fn call_builtin_vec(
             _ => Ok(vec![length(input)?]),
         },
         ("keys" | "keys_unsorted", 0) => Ok(vec![keys(input, name == "keys")?]),
-        ("values", 0) => match input {
-            Value::Object(m) => Ok(vec![Value::Array(m.values().cloned().collect())]),
-            Value::Array(_) => Ok(vec![input.clone()]),
-            _ => Err(EvalError::Qf(QfError::TypeError(format!(
-                "{} is not iterable",
-                value_type(input)
-            )))),
-        },
+        ("values", 0) => {
+            if input.is_null() {
+                Ok(vec![])
+            } else {
+                Ok(vec![input.clone()])
+            }
+        }
+        ("objects", 0) => Ok(if input.is_object() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("arrays", 0) => Ok(if input.is_array() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("strings", 0) => Ok(if input.is_string() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("numbers", 0) => Ok(if input.is_number() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("booleans", 0) => Ok(if input.is_boolean() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("nulls", 0) => Ok(if input.is_null() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("iterables", 0) => Ok(if input.is_array() || input.is_object() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
+        ("scalars", 0) => Ok(if !input.is_array() && !input.is_object() {
+            vec![input.clone()]
+        } else {
+            vec![]
+        }),
         ("has", 1) => {
             let keys = eval_inner(&args[0], input, env)?;
             let mut results = Vec::new();
@@ -1053,65 +1394,39 @@ fn call_builtin_vec(
             }
             Ok(results)
         }
-        ("sub", 2) | ("sub", 3) => {
-            let patterns = eval_inner(&args[0], input, env)?;
-            let replacements = eval_inner(&args[1], input, env)?;
-            let flags_list = if args.len() > 2 {
-                eval_inner(&args[2], input, env)?
-                    .into_iter()
-                    .map(|v| v.as_str().unwrap_or("").to_string())
-                    .collect()
-            } else {
-                vec![String::new()]
-            };
-            let mut results = Vec::new();
-            for pattern in &patterns {
-                for replacement in &replacements {
-                    for flags in &flags_list {
-                        match (input, pattern, replacement) {
-                            (Value::String(s), Value::String(p), Value::String(r)) => {
-                                let re = build_regex(p, flags)?;
-                                results.push(Value::String(re.replace(s, r.as_str()).to_string()));
-                            }
-                            _ => {
-                                return Err(EvalError::Qf(QfError::TypeError(
-                                    "sub requires strings".into(),
-                                )))
-                            }
-                        }
-                    }
+        ("sub", 2) | ("sub", 3) | ("gsub", 2) | ("gsub", 3) => {
+            let s = match input {
+                Value::String(s) => s.as_str(),
+                _ => {
+                    return Err(EvalError::Qf(QfError::TypeError(format!(
+                        "{name} requires string input"
+                    ))))
                 }
-            }
-            Ok(results)
-        }
-        ("gsub", 2) | ("gsub", 3) => {
+            };
             let patterns = eval_inner(&args[0], input, env)?;
-            let replacements = eval_inner(&args[1], input, env)?;
             let flags_list = if args.len() > 2 {
                 eval_inner(&args[2], input, env)?
                     .into_iter()
-                    .map(|v| v.as_str().unwrap_or("").to_string())
-                    .collect()
+                    .map(|v| {
+                        v.as_str().map(String::from).ok_or_else(|| {
+                            EvalError::Qf(QfError::TypeError(format!(
+                                "{name} flags must be string"
+                            )))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
             } else {
                 vec![String::new()]
             };
             let mut results = Vec::new();
             for pattern in &patterns {
-                for replacement in &replacements {
-                    for flags in &flags_list {
-                        match (input, pattern, replacement) {
-                            (Value::String(s), Value::String(p), Value::String(r)) => {
-                                let re = build_regex(p, flags)?;
-                                results
-                                    .push(Value::String(re.replace_all(s, r.as_str()).to_string()));
-                            }
-                            _ => {
-                                return Err(EvalError::Qf(QfError::TypeError(
-                                    "gsub requires strings".into(),
-                                )))
-                            }
-                        }
-                    }
+                let p = pattern.as_str().ok_or_else(|| {
+                    EvalError::Qf(QfError::TypeError(format!("{name} pattern must be string")))
+                })?;
+                for flags in &flags_list {
+                    let re = build_regex(p, flags)?;
+                    let global = name == "gsub" || flags.contains('g');
+                    results.extend(eval_regex_replace(s, &re, &args[1], env, global)?);
                 }
             }
             Ok(results)
@@ -1159,6 +1474,47 @@ fn call_builtin_vec(
         ("ceil", 0) => num_op(input, f64::ceil),
         ("round", 0) => num_op(input, f64::round),
         ("fabs", 0) => num_op(input, f64::abs),
+        ("abs", 0) => match input {
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    if let Some(a) = i.checked_abs() {
+                        return Ok(vec![Value::Number(a.into())]);
+                    }
+                }
+                num_op(input, f64::abs)
+            }
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
+                "number required, got {}",
+                value_type(input)
+            )))),
+        },
+        ("now", 0) => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            Ok(vec![json_f64(secs)])
+        }
+        ("todate", 0) => match input {
+            Value::Number(n) => {
+                let secs = n.as_f64().unwrap_or(0.0).floor() as i64;
+                Ok(vec![Value::String(unix_to_iso8601(secs))])
+            }
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
+                "todate requires number, got {}",
+                value_type(input)
+            )))),
+        },
+        ("fromdate", 0) => match input {
+            Value::String(s) => {
+                let secs = iso8601_to_unix(s)?;
+                Ok(vec![Value::Number(secs.into())])
+            }
+            _ => Err(EvalError::Qf(QfError::TypeError(format!(
+                "fromdate requires string, got {}",
+                value_type(input)
+            )))),
+        },
         ("sqrt", 0) => num_op(input, f64::sqrt),
         ("log", 0) => num_op(input, f64::ln),
         ("log2", 0) => num_op(input, f64::log2),
@@ -1414,8 +1770,9 @@ pub fn apply_format(name: &str, input: &Value) -> Result<Vec<Value>, QfError> {
                 .collect();
             Ok(vec![Value::String(encoded)])
         }
-        "csv" => format_as_csv(input, b','),
-        "tsv" => format_as_csv(input, b'\t'),
+        "csv" => format_as_csv(input),
+        "tsv" => format_as_tsv(input),
+        "sh" => format_as_sh(input),
         "html" => {
             let s = value_to_string(input);
             let escaped = s
@@ -1505,16 +1862,6 @@ fn value_contains(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn json_f64(f: f64) -> Value {
-    if f.fract() == 0.0 && f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-        Value::Number((f as i64).into())
-    } else {
-        serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null)
-    }
-}
-
 fn num_op(input: &Value, f: fn(f64) -> f64) -> Result<Vec<Value>, EvalError> {
     match input {
         Value::Number(n) => {
@@ -1571,30 +1918,199 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
-fn format_as_csv(input: &Value, delimiter: u8) -> Result<Vec<Value>, QfError> {
+fn format_as_csv(input: &Value) -> Result<Vec<Value>, QfError> {
     match input {
         Value::Array(arr) => {
-            let mut wtr = csv::WriterBuilder::new()
-                .delimiter(delimiter)
-                .from_writer(vec![]);
-            let fields: Vec<String> = arr
-                .iter()
-                .map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    Value::Null => String::new(),
-                    v => v.to_string(),
-                })
-                .collect();
-            wtr.write_record(&fields)
-                .map_err(|e| QfError::Runtime(e.to_string()))?;
-            let bytes = wtr
-                .into_inner()
-                .map_err(|e| QfError::Runtime(e.to_string()))?;
-            let s = String::from_utf8(bytes).map_err(|e| QfError::Runtime(e.to_string()))?;
-            Ok(vec![Value::String(s.trim_end().to_string())])
+            let mut parts = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v {
+                    Value::String(s) => parts.push(format!("\"{}\"", s.replace('"', "\"\""))),
+                    Value::Null => parts.push(String::new()),
+                    Value::Bool(b) => parts.push(b.to_string()),
+                    Value::Number(n) => parts.push(n.to_string()),
+                    _ => {
+                        return Err(QfError::TypeError(format!(
+                            "{} is not valid in a csv row",
+                            value_type(v)
+                        )));
+                    }
+                }
+            }
+            Ok(vec![Value::String(parts.join(","))])
         }
-        _ => Err(QfError::TypeError("@csv/@tsv requires array".into())),
+        _ => Err(QfError::TypeError("@csv requires array".into())),
     }
+}
+
+fn format_as_tsv(input: &Value) -> Result<Vec<Value>, QfError> {
+    match input {
+        Value::Array(arr) => {
+            let mut parts = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v {
+                    Value::String(s) => {
+                        let mut escaped = String::with_capacity(s.len());
+                        for ch in s.chars() {
+                            match ch {
+                                '\\' => escaped.push_str("\\\\"),
+                                '\t' => escaped.push_str("\\t"),
+                                '\n' => escaped.push_str("\\n"),
+                                '\r' => escaped.push_str("\\r"),
+                                _ => escaped.push(ch),
+                            }
+                        }
+                        parts.push(escaped);
+                    }
+                    Value::Null => parts.push(String::new()),
+                    Value::Bool(b) => parts.push(b.to_string()),
+                    Value::Number(n) => parts.push(n.to_string()),
+                    _ => {
+                        return Err(QfError::TypeError(format!(
+                            "{} is not valid in a tsv row",
+                            value_type(v)
+                        )));
+                    }
+                }
+            }
+            Ok(vec![Value::String(parts.join("\t"))])
+        }
+        _ => Err(QfError::TypeError("@tsv requires array".into())),
+    }
+}
+
+fn format_sh_scalar(v: &Value) -> Result<String, QfError> {
+    match v {
+        Value::String(s) => Ok(format!("'{}'", s.replace('\'', "'\\''"))),
+        Value::Null => Ok("null".into()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        _ => Err(QfError::TypeError(format!(
+            "{} cannot be escaped for shell",
+            value_type(v)
+        ))),
+    }
+}
+
+fn format_as_sh(input: &Value) -> Result<Vec<Value>, QfError> {
+    match input {
+        Value::Array(arr) => {
+            let parts = arr
+                .iter()
+                .map(format_sh_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(vec![Value::String(parts.join(" "))])
+        }
+        _ => Ok(vec![Value::String(format_sh_scalar(input)?)]),
+    }
+}
+
+fn eval_regex_replace(
+    s: &str,
+    re: &Regex,
+    repl_expr: &Expr,
+    env: &Env,
+    global: bool,
+) -> Result<Vec<Value>, EvalError> {
+    let matches: Vec<regex::Captures<'_>> = if global {
+        re.captures_iter(s).collect()
+    } else {
+        re.captures(s).into_iter().collect()
+    };
+    if matches.is_empty() {
+        return Ok(vec![Value::String(s.to_string())]);
+    }
+    let mut partials = vec![String::new()];
+    let mut last_end = 0;
+    for caps in matches {
+        let m = caps.get(0).unwrap();
+        let prefix = &s[last_end..m.start()];
+        let mut cap_obj = serde_json::Map::new();
+        for name in re.capture_names().flatten() {
+            let val = match caps.name(name) {
+                Some(cm) => Value::String(cm.as_str().to_string()),
+                None => Value::Null,
+            };
+            cap_obj.insert(name.to_string(), val);
+        }
+        let repl_vals = eval_inner(repl_expr, &Value::Object(cap_obj), env)?;
+        let mut next_partials = Vec::with_capacity(partials.len() * repl_vals.len());
+        for rv in repl_vals {
+            let r_str = rv.as_str().ok_or_else(|| {
+                EvalError::Qf(QfError::TypeError(
+                    "sub/gsub replacement must be string".into(),
+                ))
+            })?;
+            for p in &partials {
+                next_partials.push(format!("{p}{prefix}{r_str}"));
+            }
+        }
+        partials = next_partials;
+        last_end = m.end();
+    }
+    let suffix = &s[last_end..];
+    for p in &mut partials {
+        p.push_str(suffix);
+    }
+    Ok(partials.into_iter().map(Value::String).collect())
+}
+
+fn unix_to_iso8601(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+
+    // Howard Hinnant's civil_from_days algorithm
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn iso8601_to_unix(s: &str) -> Result<i64, EvalError> {
+    let err = || EvalError::Qf(QfError::Runtime(format!("invalid ISO 8601 date: {s}")));
+    let s = s.strip_suffix('Z').ok_or_else(err)?;
+    let (date_part, time_part) = s.split_once('T').ok_or_else(err)?;
+    let d_parts: Vec<&str> = date_part.split('-').collect();
+    let t_parts: Vec<&str> = time_part.split(':').collect();
+    if d_parts.len() != 3 || t_parts.len() != 3 {
+        return Err(err());
+    }
+    let y: i64 = d_parts[0].parse().map_err(|_| err())?;
+    let m: i64 = d_parts[1].parse().map_err(|_| err())?;
+    let d: i64 = d_parts[2].parse().map_err(|_| err())?;
+    let hh: i64 = t_parts[0].parse().map_err(|_| err())?;
+    let mm: i64 = t_parts[1].parse().map_err(|_| err())?;
+    let sec_str = t_parts[2].split('.').next().unwrap_or(t_parts[2]);
+    let ss: i64 = sec_str.parse().map_err(|_| err())?;
+
+    if !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+        || !(0..=23).contains(&hh)
+        || !(0..=59).contains(&mm)
+        || !(0..=59).contains(&ss)
+    {
+        return Err(err());
+    }
+
+    // Howard Hinnant's days_from_civil algorithm
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+
+    Ok(days * 86400 + hh * 3600 + mm * 60 + ss)
 }
 
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -1683,8 +2199,17 @@ fn builtin_names() -> Vec<String> {
         "keys",
         "keys_unsorted",
         "values",
+        "objects",
+        "arrays",
+        "strings",
+        "numbers",
+        "booleans",
+        "nulls",
+        "iterables",
+        "scalars",
         "has",
         "in",
+        "IN",
         "type",
         "infinite",
         "nan",
@@ -1694,6 +2219,7 @@ fn builtin_names() -> Vec<String> {
         "builtins",
         "select",
         "empty",
+        "isempty",
         "error",
         "debug",
         "map",
@@ -1730,6 +2256,7 @@ fn builtin_names() -> Vec<String> {
         "rtrimstr",
         "trim",
         "split",
+        "splits",
         "join",
         "startswith",
         "endswith",
@@ -1750,10 +2277,17 @@ fn builtin_names() -> Vec<String> {
         "until",
         "while",
         "repeat",
+        "walk",
+        "tostream",
+        "fromstream",
         "floor",
         "ceil",
         "round",
         "fabs",
+        "abs",
+        "now",
+        "todate",
+        "fromdate",
         "sqrt",
         "log",
         "log2",
@@ -1838,5 +2372,183 @@ mod tests {
     fn test_flatten() {
         let result = flatten(&json!([[1, 2], [3, [4, 5]]]), usize::MAX).unwrap();
         assert_eq!(result, vec![json!([1, 2, 3, 4, 5])]);
+    }
+
+    fn run_jq(input_str: &str, query: &str) -> Vec<Value> {
+        let input: Value = serde_json::from_str(input_str).unwrap();
+        let mut lexer = crate::query::lexer::Lexer::new(query);
+        let tokens = lexer.tokenize().unwrap().to_vec();
+        let expr = crate::query::jq_parser::Parser::new(tokens)
+            .parse()
+            .unwrap();
+        let env = Env::new();
+        super::super::eval::eval(&expr, &input, &env).unwrap()
+    }
+
+    #[test]
+    fn test_values_and_type_selectors() {
+        assert_eq!(run_jq("null", "values"), Vec::<Value>::new());
+        assert_eq!(
+            run_jq(r#"[1, null, "a", true, {}, []]"#, "[.[] | values]"),
+            vec![json!([1, "a", true, {}, []])]
+        );
+        let mixed = r#"[null, true, false, 1, "s", [1], {"a":1}]"#;
+        assert_eq!(run_jq(mixed, "[.[] | objects]"), vec![json!([{"a": 1}])]);
+        assert_eq!(run_jq(mixed, "[.[] | arrays]"), vec![json!([[1]])]);
+        assert_eq!(run_jq(mixed, "[.[] | strings]"), vec![json!(["s"])]);
+        assert_eq!(run_jq(mixed, "[.[] | numbers]"), vec![json!([1])]);
+        assert_eq!(
+            run_jq(mixed, "[.[] | booleans]"),
+            vec![json!([true, false])]
+        );
+        assert_eq!(run_jq(mixed, "[.[] | nulls]"), vec![json!([null])]);
+        assert_eq!(
+            run_jq(mixed, "[.[] | iterables]"),
+            vec![json!([[1], {"a": 1}])]
+        );
+        assert_eq!(
+            run_jq(mixed, "[.[] | scalars]"),
+            vec![json!([null, true, false, 1, "s"])]
+        );
+    }
+
+    #[test]
+    fn test_format_csv_and_sh() {
+        assert_eq!(
+            run_jq(r#"[1, "a", "x\"y", null, true]"#, "@csv"),
+            vec![json!("1,\"a\",\"x\"\"y\",,true")]
+        );
+        assert_eq!(
+            run_jq(r#"["a", "b'c", 1, true, null]"#, "@sh"),
+            vec![json!("'a' 'b'\\''c' 1 true null")]
+        );
+    }
+
+    #[test]
+    fn test_sub_and_gsub_flags_and_named_captures() {
+        assert_eq!(
+            run_jq(r#""Hello HELLO""#, r#"sub("hello"; "hi"; "i")"#),
+            vec![json!("hi HELLO")]
+        );
+        assert_eq!(
+            run_jq(r#""Hello HELLO""#, r#"sub("hello"; "hi"; "ig")"#),
+            vec![json!("hi hi")]
+        );
+        assert_eq!(
+            run_jq(r#""a1b2""#, r#"gsub("(?<d>[0-9])"; "[\(.d)]")"#),
+            vec![json!("a[1]b[2]")]
+        );
+        assert_eq!(
+            run_jq(
+                r#""foo bar""#,
+                r#"sub("(?<w>[a-z]+)"; "\(.w | ascii_upcase)")"#
+            ),
+            vec![json!("FOO bar")]
+        );
+    }
+
+    #[test]
+    fn test_map_values_empty() {
+        assert_eq!(
+            run_jq(r#"{"a": 1, "b": 2}"#, "map_values(empty)"),
+            vec![json!({})]
+        );
+        assert_eq!(
+            run_jq(r#"{"a": 1, "b": 3}"#, "map_values(select(. > 1))"),
+            vec![json!({"b": 3})]
+        );
+    }
+
+    #[test]
+    fn test_abs_splits_any_all_isempty_in_nth() {
+        assert_eq!(run_jq("-5", "abs"), vec![json!(5)]);
+        assert_eq!(run_jq("-2.5", "abs"), vec![json!(2.5)]);
+        assert_eq!(
+            run_jq(r#""a, b; c""#, r#"[splits("[,;]\\s*")]"#),
+            vec![json!(["a", "b", "c"])]
+        );
+        assert_eq!(
+            run_jq(r#""aXbxc""#, r#"[splits("x"; "i")]"#),
+            vec![json!(["a", "b", "c"])]
+        );
+        assert_eq!(
+            run_jq("null", "any(range(1000000000); . == 5)"),
+            vec![json!(true)]
+        );
+        assert_eq!(run_jq("null", "all(range(5); . < 5)"), vec![json!(true)]);
+        assert_eq!(
+            run_jq("null", "all(range(1000000000); . < 3)"),
+            vec![json!(false)]
+        );
+        assert_eq!(run_jq("null", "isempty(empty)"), vec![json!(true)]);
+        assert_eq!(run_jq("null", "isempty(1, 2)"), vec![json!(false)]);
+        assert_eq!(run_jq("2", "IN(1, 2, 3)"), vec![json!(true)]);
+        assert_eq!(run_jq("4", "IN(1, 2, 3)"), vec![json!(false)]);
+        assert_eq!(run_jq("null", "nth(5; range(1000000000))"), vec![json!(5)]);
+    }
+
+    #[test]
+    fn test_walk_tostream_fromstream() {
+        assert_eq!(
+            run_jq(
+                r#"{"a": [1, 2], "b": {"c": 3}}"#,
+                "walk(if type == \"number\" then . + 1 else . end)"
+            ),
+            vec![json!({"a": [2, 3], "b": {"c": 4}})]
+        );
+        assert_eq!(
+            run_jq("[1, 2]", "[tostream]"),
+            vec![json!([[[0], 1], [[1], 2], [[1]]])]
+        );
+        assert_eq!(
+            run_jq(r#"{"a": 1, "b": [2, {}]}"#, "fromstream(tostream)"),
+            vec![json!({"a": 1, "b": [2, {}]})]
+        );
+        assert_eq!(run_jq("42", "fromstream(tostream)"), vec![json!(42)]);
+    }
+
+    #[test]
+    fn test_now_todate_fromdate() {
+        let now_res = run_jq("null", "now");
+        assert_eq!(now_res.len(), 1);
+        assert!(now_res[0].as_f64().unwrap() > 1_700_000_000.0);
+
+        assert_eq!(run_jq("0", "todate"), vec![json!("1970-01-01T00:00:00Z")]);
+        assert_eq!(
+            run_jq("1700000000", "todate"),
+            vec![json!("2023-11-14T22:13:20Z")]
+        );
+        assert_eq!(
+            run_jq(r#""2023-11-14T22:13:20Z""#, "fromdate"),
+            vec![json!(1700000000)]
+        );
+        assert_eq!(run_jq("-86400", "todate | fromdate"), vec![json!(-86400)]);
+    }
+
+    #[test]
+    fn test_builtins_list_contains_new_entries() {
+        let names = builtin_names();
+        for expected in [
+            "abs",
+            "objects",
+            "arrays",
+            "strings",
+            "numbers",
+            "booleans",
+            "nulls",
+            "iterables",
+            "scalars",
+            "splits",
+            "isempty",
+            "IN",
+            "walk",
+            "tostream",
+            "fromstream",
+            "now",
+            "todate",
+            "fromdate",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
     }
 }
