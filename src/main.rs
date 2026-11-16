@@ -1,4 +1,4 @@
-use std::io::{self, BufWriter, ErrorKind, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -520,42 +520,54 @@ fn run_stdin<W: Write>(
     opts: FormatOpts,
     writer: W,
 ) -> Result<(usize, Option<Value>, bool), CliError> {
+    if cli.jsonl && !cli.slurp {
+        if let Some(ref fmt) = cli.input_format {
+            Format::from_str_name(fmt)?;
+        }
+        let out_fmt = resolve_output_format(cli.output_format.as_deref(), Format::Json)?;
+        let mut out = OutputState::new(writer, out_fmt, opts);
+        let reader = BufReader::new(io::stdin().lock());
+        stream_ndjson_reader_to_out(reader, query_str, &mut out)?;
+        out.flush()?;
+        return Ok((out.output_count, out.last_value, out.broken_pipe));
+    }
+
+    if cli.stream && !cli.slurp {
+        let mut reader = BufReader::new(io::stdin().lock());
+        let in_fmt =
+            resolve_input_format_from_reader(cli.input_format.as_deref(), None, &mut reader)?;
+        let out_fmt = resolve_output_format(cli.output_format.as_deref(), Format::Json)?;
+        let mut out = OutputState::new(writer, out_fmt, opts);
+        stream_process_reader_to_out(reader, in_fmt, query_str, &mut out)?;
+        out.flush()?;
+        return Ok((out.output_count, out.last_value, out.broken_pipe));
+    }
+
     let input = read_stdin()?;
     let in_fmt = resolve_input_format(cli.input_format.as_deref(), None, &input)?;
-    let default_out = if cli.stream || cli.jsonl {
-        Format::Json
-    } else {
-        in_fmt
-    };
-    let out_fmt = resolve_output_format(cli.output_format.as_deref(), default_out)?;
+    let out_fmt = resolve_output_format(cli.output_format.as_deref(), in_fmt)?;
     let mut out = OutputState::new(writer, out_fmt, opts);
 
-    if cli.jsonl && !cli.slurp {
-        stream_ndjson_to_out(&input, query_str, &mut out)?;
-    } else if cli.stream && !cli.slurp {
-        stream_process_to_out(&input, in_fmt, query_str, &mut out)?;
+    let values = parse_values(&input, in_fmt)?;
+    if cli.slurp {
+        let results = query::query(&Value::Array(values), query_str)?;
+        for res in results {
+            out.write_value(res)?;
+            if out.broken_pipe {
+                break;
+            }
+        }
     } else {
-        let values = parse_values(&input, in_fmt)?;
-        if cli.slurp {
-            let results = query::query(&Value::Array(values), query_str)?;
+        for val in &values {
+            let results = query::query(val, query_str)?;
             for res in results {
                 out.write_value(res)?;
                 if out.broken_pipe {
                     break;
                 }
             }
-        } else {
-            for val in &values {
-                let results = query::query(val, query_str)?;
-                for res in results {
-                    out.write_value(res)?;
-                    if out.broken_pipe {
-                        break;
-                    }
-                }
-                if out.broken_pipe {
-                    break;
-                }
+            if out.broken_pipe {
+                break;
             }
         }
     }
@@ -604,32 +616,52 @@ fn run_files<W: Write>(
     let mut writer_opt = Some(writer);
 
     for path in &cli.files {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| CliError::io(format!("reading {}: {e}", path.display())))?;
-        let in_fmt = resolve_input_format(cli.input_format.as_deref(), Some(path), &content)?;
         let is_ndjson =
             cli.jsonl || (cli.input_format.is_none() && Format::is_ndjson_extension(path));
 
-        if out_opt.is_none() {
-            let default_out = if cli.stream || is_ndjson {
-                Format::Json
-            } else {
-                in_fmt
-            };
-            let out_fmt = resolve_output_format(cli.output_format.as_deref(), default_out)?;
-            out_opt = Some(OutputState::new(
-                writer_opt.take().unwrap(),
-                out_fmt,
-                opts.clone(),
-            ));
-        }
-
-        let out = out_opt.as_mut().unwrap();
         if is_ndjson {
-            stream_ndjson_to_out(&content, query_str, out)?;
+            if let Some(ref fmt) = cli.input_format {
+                Format::from_str_name(fmt)?;
+            }
+            let file = std::fs::File::open(path)
+                .map_err(|e| CliError::io(format!("reading {}: {e}", path.display())))?;
+            let reader = BufReader::new(file);
+            let out = init_output_state(
+                &mut out_opt,
+                &mut writer_opt,
+                cli.output_format.as_deref(),
+                Format::Json,
+                &opts,
+            )?;
+            stream_ndjson_reader_to_out(reader, query_str, out)?;
         } else if cli.stream {
-            stream_process_to_out(&content, in_fmt, query_str, out)?;
+            let file = std::fs::File::open(path)
+                .map_err(|e| CliError::io(format!("reading {}: {e}", path.display())))?;
+            let mut reader = BufReader::new(file);
+            let in_fmt = resolve_input_format_from_reader(
+                cli.input_format.as_deref(),
+                Some(path),
+                &mut reader,
+            )?;
+            let out = init_output_state(
+                &mut out_opt,
+                &mut writer_opt,
+                cli.output_format.as_deref(),
+                Format::Json,
+                &opts,
+            )?;
+            stream_process_reader_to_out(reader, in_fmt, query_str, out)?;
         } else {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| CliError::io(format!("reading {}: {e}", path.display())))?;
+            let in_fmt = resolve_input_format(cli.input_format.as_deref(), Some(path), &content)?;
+            let out = init_output_state(
+                &mut out_opt,
+                &mut writer_opt,
+                cli.output_format.as_deref(),
+                in_fmt,
+                &opts,
+            )?;
             let values = parse_values(&content, in_fmt)?;
             for val in &values {
                 let results = query::query(val, query_str)?;
@@ -645,7 +677,7 @@ fn run_files<W: Write>(
             }
         }
 
-        if out.broken_pipe {
+        if out_opt.as_ref().is_some_and(|o| o.broken_pipe) {
             break;
         }
     }
@@ -655,12 +687,30 @@ fn run_files<W: Write>(
     Ok((out.output_count, out.last_value, out.broken_pipe))
 }
 
-fn stream_ndjson_to_out<W: Write>(
-    input: &str,
+fn init_output_state<'a, W: Write>(
+    out_opt: &'a mut Option<OutputState<W>>,
+    writer_opt: &mut Option<W>,
+    cli_out_fmt: Option<&str>,
+    default_out: Format,
+    opts: &FormatOpts,
+) -> Result<&'a mut OutputState<W>, CliError> {
+    if out_opt.is_none() {
+        let out_fmt = resolve_output_format(cli_out_fmt, default_out)?;
+        *out_opt = Some(OutputState::new(
+            writer_opt.take().unwrap(),
+            out_fmt,
+            opts.clone(),
+        ));
+    }
+    Ok(out_opt.as_mut().unwrap())
+}
+
+fn stream_ndjson_reader_to_out<R: BufRead, W: Write>(
+    reader: R,
     query_str: &str,
     out: &mut OutputState<W>,
 ) -> Result<(), CliError> {
-    let res = stream::stream_ndjson(input, query_str, |result| {
+    let res = stream::stream_ndjson_reader(reader, query_str, |result| {
         if let Err(err) = out.write_value(result) {
             return Err(QfError::Runtime(err.message));
         }
@@ -676,13 +726,13 @@ fn stream_ndjson_to_out<W: Write>(
     }
 }
 
-fn stream_process_to_out<W: Write>(
-    input: &str,
+fn stream_process_reader_to_out<R: BufRead, W: Write>(
+    reader: R,
     in_fmt: Format,
     query_str: &str,
     out: &mut OutputState<W>,
 ) -> Result<(), CliError> {
-    let res = stream::stream_process(input, in_fmt, query_str, |result| {
+    let res = stream::stream_process_reader(reader, in_fmt, query_str, |result| {
         if let Err(err) = out.write_value(result) {
             return Err(QfError::Runtime(err.message));
         }
@@ -696,6 +746,37 @@ fn stream_process_to_out<W: Write>(
         }
         Err(e) => Err(CliError::from(e)),
     }
+}
+
+fn resolve_input_format_from_reader<R: BufRead>(
+    cli_fmt: Option<&str>,
+    path: Option<&Path>,
+    reader: &mut R,
+) -> Result<Format, CliError> {
+    match cli_fmt {
+        Some(f) => Ok(Format::from_str_name(f)?),
+        None => match path {
+            Some(p) => match Format::from_extension(p) {
+                Ok(fmt) => Ok(fmt),
+                Err(QfError::NoExtension | QfError::UnknownExtension(_)) => {
+                    detect_format_from_bufread(reader)
+                }
+                Err(e) => Err(CliError::from(e)),
+            },
+            None => detect_format_from_bufread(reader),
+        },
+    }
+}
+
+fn detect_format_from_bufread<R: BufRead>(reader: &mut R) -> Result<Format, CliError> {
+    let buf = reader
+        .fill_buf()
+        .map_err(|e| CliError::io(format!("reading input: {e}")))?;
+    let prefix = match std::str::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&buf[..e.valid_up_to()]).unwrap_or(""),
+    };
+    Ok(Format::detect_from_content(prefix))
 }
 
 fn read_stdin() -> Result<String, CliError> {
