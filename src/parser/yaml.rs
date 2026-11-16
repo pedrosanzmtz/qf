@@ -19,52 +19,52 @@ pub fn parse(input: &str) -> Result<Value, QfError> {
 
 /// Parse a YAML string containing one or more documents into a `Vec<Value>`.
 ///
-/// Iterates over all YAML documents using `serde_yaml::Deserializer` and
+/// Iterates over all YAML documents using `serde_yaml_ng::Deserializer` and
 /// resolves YAML merge keys (`<<`) in each document.
 pub fn parse_all(input: &str) -> Result<Vec<Value>, QfError> {
     let mut docs = Vec::new();
-    for doc in serde_yaml::Deserializer::from_str(input) {
+    for doc in serde_yaml_ng::Deserializer::from_str(input) {
         let yaml_value =
-            serde_yaml::Value::deserialize(doc).map_err(|e| QfError::Parse(e.to_string()))?;
+            serde_yaml_ng::Value::deserialize(doc).map_err(|e| QfError::Parse(e.to_string()))?;
         let resolved = resolve_merges(yaml_value)?;
         docs.push(yaml_to_json(resolved)?);
     }
     Ok(docs)
 }
 
-/// Recursively resolve YAML 1.1 merge keys (`<<`) in `serde_yaml::Value`.
+/// Recursively resolve YAML 1.1 merge keys (`<<`) in `serde_yaml_ng::Value`.
 ///
 /// Explicit keys in a mapping always take precedence over merged keys.
 /// When `<<` maps to a sequence of mappings, earlier mappings in the sequence
 /// take precedence over later ones.
-fn resolve_merges(yaml: serde_yaml::Value) -> Result<serde_yaml::Value, QfError> {
+fn resolve_merges(yaml: serde_yaml_ng::Value) -> Result<serde_yaml_ng::Value, QfError> {
     match yaml {
-        serde_yaml::Value::Sequence(seq) => {
+        serde_yaml_ng::Value::Sequence(seq) => {
             let resolved: Result<Vec<_>, _> = seq.into_iter().map(resolve_merges).collect();
-            Ok(serde_yaml::Value::Sequence(resolved?))
+            Ok(serde_yaml_ng::Value::Sequence(resolved?))
         }
-        serde_yaml::Value::Tagged(mut tagged) => {
+        serde_yaml_ng::Value::Tagged(mut tagged) => {
             tagged.value = resolve_merges(tagged.value)?;
-            Ok(serde_yaml::Value::Tagged(tagged))
+            Ok(serde_yaml_ng::Value::Tagged(tagged))
         }
-        serde_yaml::Value::Mapping(mut map) => {
-            let merge_key = serde_yaml::Value::String("<<".to_string());
+        serde_yaml_ng::Value::Mapping(mut map) => {
+            let merge_key = serde_yaml_ng::Value::String("<<".to_string());
             let merge_val = map.remove(&merge_key);
 
-            let mut resolved = serde_yaml::Mapping::new();
+            let mut resolved = serde_yaml_ng::Mapping::new();
             for (k, v) in map {
                 resolved.insert(k, resolve_merges(v)?);
             }
 
             if let Some(mv) = merge_val {
                 match resolve_merges(mv)? {
-                    serde_yaml::Value::Mapping(m) => {
+                    serde_yaml_ng::Value::Mapping(m) => {
                         merge_into(&mut resolved, m);
                     }
-                    serde_yaml::Value::Sequence(seq) => {
+                    serde_yaml_ng::Value::Sequence(seq) => {
                         for item in seq {
                             match item {
-                                serde_yaml::Value::Mapping(m) => merge_into(&mut resolved, m),
+                                serde_yaml_ng::Value::Mapping(m) => merge_into(&mut resolved, m),
                                 _ => {
                                     return Err(QfError::Parse(
                                         "YAML merge key '<<' sequence elements must be mappings"
@@ -83,13 +83,13 @@ fn resolve_merges(yaml: serde_yaml::Value) -> Result<serde_yaml::Value, QfError>
                 }
             }
 
-            Ok(serde_yaml::Value::Mapping(resolved))
+            Ok(serde_yaml_ng::Value::Mapping(resolved))
         }
         other => Ok(other),
     }
 }
 
-fn merge_into(target: &mut serde_yaml::Mapping, source: serde_yaml::Mapping) {
+fn merge_into(target: &mut serde_yaml_ng::Mapping, source: serde_yaml_ng::Mapping) {
     for (k, v) in source {
         if !target.contains_key(&k) {
             target.insert(k, v);
@@ -97,11 +97,11 @@ fn merge_into(target: &mut serde_yaml::Mapping, source: serde_yaml::Mapping) {
     }
 }
 
-fn yaml_to_json(yaml: serde_yaml::Value) -> Result<Value, QfError> {
+fn yaml_to_json(yaml: serde_yaml_ng::Value) -> Result<Value, QfError> {
     match yaml {
-        serde_yaml::Value::Null => Ok(Value::Null),
-        serde_yaml::Value::Bool(b) => Ok(Value::Bool(b)),
-        serde_yaml::Value::Number(n) => {
+        serde_yaml_ng::Value::Null => Ok(Value::Null),
+        serde_yaml_ng::Value::Bool(b) => Ok(Value::Bool(b)),
+        serde_yaml_ng::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(Value::Number(i.into()))
             } else if let Some(u) = n.as_u64() {
@@ -114,26 +114,26 @@ fn yaml_to_json(yaml: serde_yaml::Value) -> Result<Value, QfError> {
                 Ok(Value::Null)
             }
         }
-        serde_yaml::Value::String(s) => Ok(Value::String(s)),
-        serde_yaml::Value::Sequence(seq) => {
+        serde_yaml_ng::Value::String(s) => Ok(Value::String(s)),
+        serde_yaml_ng::Value::Sequence(seq) => {
             let items: Result<Vec<Value>, _> = seq.into_iter().map(yaml_to_json).collect();
             Ok(Value::Array(items?))
         }
-        serde_yaml::Value::Mapping(map) => {
+        serde_yaml_ng::Value::Mapping(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map {
                 let key = match k {
-                    serde_yaml::Value::String(s) => s,
-                    serde_yaml::Value::Number(n) => n.to_string(),
-                    serde_yaml::Value::Bool(b) => b.to_string(),
-                    serde_yaml::Value::Null => "null".to_string(),
+                    serde_yaml_ng::Value::String(s) => s,
+                    serde_yaml_ng::Value::Number(n) => n.to_string(),
+                    serde_yaml_ng::Value::Bool(b) => b.to_string(),
+                    serde_yaml_ng::Value::Null => "null".to_string(),
                     _ => return Err(QfError::Parse("unsupported YAML map key type".into())),
                 };
                 obj.insert(key, yaml_to_json(v)?);
             }
             Ok(Value::Object(obj))
         }
-        serde_yaml::Value::Tagged(tagged) => yaml_to_json(tagged.value),
+        serde_yaml_ng::Value::Tagged(tagged) => yaml_to_json(tagged.value),
     }
 }
 
