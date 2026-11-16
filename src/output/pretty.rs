@@ -67,13 +67,26 @@ fn format_xml(value: &Value) -> Result<String, QfError> {
 }
 
 fn format_toml(value: &Value) -> Result<String, QfError> {
-    let toml_val = json_to_toml(value)?;
-    toml::to_string_pretty(&toml_val).map_err(|e| QfError::Parse(e.to_string()))
+    match value {
+        Value::Object(_) => {
+            let toml_val = json_to_toml(value)?;
+            toml::to_string_pretty(&toml_val).map_err(|e| QfError::Serialize(e.to_string()))
+        }
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok("null".to_string()),
+        Value::Array(_) => {
+            serde_json::to_string_pretty(value).map_err(|e| QfError::Serialize(e.to_string()))
+        }
+    }
 }
 
 fn json_to_toml(value: &Value) -> Result<toml::Value, QfError> {
     match value {
-        Value::Null => Ok(toml::Value::String("null".to_string())),
+        Value::Null => Err(QfError::Serialize(
+            "TOML does not support null values".to_string(),
+        )),
         Value::Bool(b) => Ok(toml::Value::Boolean(*b)),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -81,10 +94,18 @@ fn json_to_toml(value: &Value) -> Result<toml::Value, QfError> {
             } else if let Some(f) = n.as_f64() {
                 Ok(toml::Value::Float(f))
             } else {
-                Err(QfError::Parse(format!("unsupported number: {n}")))
+                Err(QfError::Serialize(format!("unsupported number: {n}")))
             }
         }
-        Value::String(s) => Ok(toml::Value::String(s.clone())),
+        Value::String(s) => {
+            // Preserve RFC3339 datetimes (date + time) as native TOML datetimes on round-trip.
+            if let Ok(dt) = s.parse::<toml::value::Datetime>() {
+                if dt.date.is_some() && dt.time.is_some() {
+                    return Ok(toml::Value::Datetime(dt));
+                }
+            }
+            Ok(toml::Value::String(s.clone()))
+        }
         Value::Array(arr) => {
             let items: Result<Vec<_>, _> = arr.iter().map(json_to_toml).collect();
             Ok(toml::Value::Array(items?))
@@ -92,55 +113,93 @@ fn json_to_toml(value: &Value) -> Result<toml::Value, QfError> {
         Value::Object(map) => {
             let mut table = toml::map::Map::new();
             for (k, v) in map {
-                table.insert(k.clone(), json_to_toml(v)?);
+                if !v.is_null() {
+                    table.insert(k.clone(), json_to_toml(v)?);
+                }
             }
             Ok(toml::Value::Table(table))
         }
     }
 }
 
+fn format_csv_cell(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 fn format_delimited(value: &Value, delimiter: u8) -> Result<String, QfError> {
     let rows = match value {
         Value::Array(arr) => arr,
-        _ => return Err(QfError::Parse("CSV/TSV output requires an array of objects".to_string())),
+        _ => {
+            return Err(QfError::Serialize(
+                "CSV/TSV output requires an array of objects or arrays".to_string(),
+            ))
+        }
     };
 
     if rows.is_empty() {
         return Ok(String::new());
     }
 
-    let headers: Vec<String> = match &rows[0] {
-        Value::Object(map) => map.keys().cloned().collect(),
-        _ => return Err(QfError::Parse("CSV/TSV output requires an array of objects".to_string())),
-    };
-
     let mut wtr = csv::WriterBuilder::new()
         .delimiter(delimiter)
+        .flexible(true)
         .from_writer(vec![]);
 
-    wtr.write_record(&headers)
-        .map_err(|e| QfError::Parse(e.to_string()))?;
+    match &rows[0] {
+        Value::Object(_) => {
+            let mut headers: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for row in rows {
+                let obj = row.as_object().ok_or_else(|| {
+                    QfError::Serialize("CSV/TSV output requires all rows to be objects".to_string())
+                })?;
+                for k in obj.keys() {
+                    if seen.insert(k.clone()) {
+                        headers.push(k.clone());
+                    }
+                }
+            }
 
-    for row in rows {
-        let obj = row.as_object().ok_or_else(|| {
-            QfError::Parse("CSV/TSV output requires an array of objects".to_string())
-        })?;
-        let fields: Vec<String> = headers
-            .iter()
-            .map(|h| match obj.get(h) {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Null) | None => String::new(),
-                Some(v) => v.to_string(),
-            })
-            .collect();
-        wtr.write_record(&fields)
-            .map_err(|e| QfError::Parse(e.to_string()))?;
+            wtr.write_record(&headers)
+                .map_err(|e| QfError::Serialize(e.to_string()))?;
+
+            for row in rows {
+                let obj = row.as_object().ok_or_else(|| {
+                    QfError::Serialize("CSV/TSV output requires all rows to be objects".to_string())
+                })?;
+                let fields: Vec<String> = headers
+                    .iter()
+                    .map(|h| obj.get(h).map_or_else(String::new, format_csv_cell))
+                    .collect();
+                wtr.write_record(&fields)
+                    .map_err(|e| QfError::Serialize(e.to_string()))?;
+            }
+        }
+        Value::Array(_) => {
+            for row in rows {
+                let arr = row.as_array().ok_or_else(|| {
+                    QfError::Serialize("CSV/TSV output requires all rows to be arrays".to_string())
+                })?;
+                let fields: Vec<String> = arr.iter().map(format_csv_cell).collect();
+                wtr.write_record(&fields)
+                    .map_err(|e| QfError::Serialize(e.to_string()))?;
+            }
+        }
+        _ => {
+            return Err(QfError::Serialize(
+                "CSV/TSV output requires an array of objects or arrays".to_string(),
+            ))
+        }
     }
 
     let bytes = wtr
         .into_inner()
-        .map_err(|e| QfError::Parse(e.to_string()))?;
-    String::from_utf8(bytes).map_err(|e| QfError::Parse(e.to_string()))
+        .map_err(|e| QfError::Serialize(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|e| QfError::Serialize(e.to_string()))
 }
 
 #[cfg(test)]
@@ -183,5 +242,81 @@ mod tests {
         let val = json!(42);
         let out = format_value(&val, Format::Json, false, true).unwrap();
         assert_eq!(out, "42");
+    }
+
+    #[test]
+    fn toml_scalar_and_array_output() {
+        assert_eq!(
+            format_value(&json!("hello"), Format::Toml, false, false).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            format_value(&json!(42), Format::Toml, false, false).unwrap(),
+            "42"
+        );
+        assert_eq!(
+            format_value(&json!(true), Format::Toml, false, false).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            format_value(&json!(null), Format::Toml, false, false).unwrap(),
+            "null"
+        );
+        let arr_out = format_value(&json!([1, 2, 3]), Format::Toml, false, false).unwrap();
+        let parsed: Value = serde_json::from_str(&arr_out).unwrap();
+        assert_eq!(parsed, json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn toml_omits_null_keys() {
+        let val = json!({
+            "name": "qf",
+            "empty": null,
+            "nested": {
+                "keep": 1,
+                "drop": null
+            }
+        });
+        let out = format_value(&val, Format::Toml, false, false).unwrap();
+        assert!(out.contains("name = \"qf\""));
+        assert!(!out.contains("empty"));
+        assert!(out.contains("keep = 1"));
+        assert!(!out.contains("drop"));
+    }
+
+    #[test]
+    fn toml_null_in_array_returns_serialize_error() {
+        let val = json!({"items": [1, null, 2]});
+        let err = format_value(&val, Format::Toml, false, false).unwrap_err();
+        assert!(matches!(err, QfError::Serialize(_)));
+    }
+
+    #[test]
+    fn toml_datetime_roundtrip() {
+        let input = "created = 2024-01-15T10:30:00Z\n";
+        let parsed = crate::parser::toml::parse(input).unwrap();
+        let out = format_value(&parsed, Format::Toml, false, false).unwrap();
+        assert_eq!(out, "created = 2024-01-15T10:30:00Z\n");
+    }
+
+    #[test]
+    fn csv_union_headers_first_seen_order() {
+        let val = json!([
+            {"a": 1, "b": 2},
+            {"b": 3, "c": 4},
+            {"d": 5, "a": 6}
+        ]);
+        let out = format_value(&val, Format::Csv, false, false).unwrap();
+        assert_eq!(out, "a,b,c,d\n1,2,,\n,3,4,\n6,,,5\n");
+    }
+
+    #[test]
+    fn csv_and_tsv_array_of_arrays_headerless() {
+        let val = json!([["Alice", 30, true], ["Bob", 25, null]]);
+        let csv_out = format_value(&val, Format::Csv, false, false).unwrap();
+        assert_eq!(csv_out, "Alice,30,true\nBob,25,\n");
+
+        let tsv_out = format_value(&val, Format::Tsv, false, false).unwrap();
+        assert_eq!(tsv_out, "Alice\t30\ttrue\nBob\t25\t\n");
     }
 }
