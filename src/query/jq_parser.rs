@@ -89,7 +89,7 @@ impl Parser {
             return self.parse_label();
         }
 
-        let mut expr = self.parse_assign()?;
+        let expr = self.parse_assign()?;
 
         // Handle `as $var |`
         if matches!(self.current(), Token::As) {
@@ -104,10 +104,10 @@ impl Parser {
             });
         }
 
-        while matches!(self.current(), Token::Pipe) {
+        if matches!(self.current(), Token::Pipe) {
             self.advance();
-            let right = self.parse_assign()?;
-            expr = Expr::Pipe(Box::new(expr), Box::new(right));
+            let right = self.parse_pipe_no_comma()?;
+            return Ok(Expr::Pipe(Box::new(expr), Box::new(right)));
         }
         Ok(expr)
     }
@@ -288,23 +288,24 @@ impl Parser {
         loop {
             match self.current() {
                 Token::Dot => {
-                    // Could be .field or just . (identity at start)
-                    if matches!(self.peek(), Token::Ident(_)) {
+                    // Could be .field or ."field"
+                    if matches!(self.peek(), Token::Ident(_) | Token::String(_)) {
                         self.advance(); // skip dot
-                        if let Token::Ident(name) = self.advance() {
-                            // Check for optional
-                            if matches!(self.current(), Token::Question) {
-                                self.advance();
-                                expr = Expr::Pipe(
-                                    Box::new(expr),
-                                    Box::new(Expr::OptionalField(name)),
-                                );
-                            } else {
-                                expr = Expr::Pipe(
-                                    Box::new(expr),
-                                    Box::new(Expr::Field(name)),
-                                );
-                            }
+                        let name = match self.advance() {
+                            Token::Ident(name) | Token::String(name) => name,
+                            _ => unreachable!(),
+                        };
+                        if matches!(self.current(), Token::Question) {
+                            self.advance();
+                            expr = Expr::Pipe(
+                                Box::new(expr),
+                                Box::new(Expr::OptionalField(name)),
+                            );
+                        } else {
+                            expr = Expr::Pipe(
+                                Box::new(expr),
+                                Box::new(Expr::Field(name)),
+                            );
                         }
                     } else {
                         break;
@@ -388,7 +389,12 @@ impl Parser {
                         // ."field-with-special-chars"
                         let s = s.clone();
                         self.advance();
-                        Ok(Expr::Field(s))
+                        if matches!(self.current(), Token::Question) {
+                            self.advance();
+                            Ok(Expr::OptionalField(s))
+                        } else {
+                            Ok(Expr::Field(s))
+                        }
                     }
                     _ => Ok(Expr::Identity),
                 }
@@ -766,33 +772,12 @@ impl Parser {
             Token::LBrace => {
                 self.advance();
                 let mut fields = Vec::new();
-                if !matches!(self.current(), Token::RBrace) {
-                    let key = match self.advance() {
-                        Token::Ident(k) => k,
-                        other => {
-                            return Err(self.error(format!(
-                                "expected field name in pattern, got {:?}",
-                                other
-                            )))
-                        }
-                    };
-                    self.expect(&Token::Colon)?;
-                    let pat = self.parse_pattern()?;
-                    fields.push((key, pat));
-                    while matches!(self.current(), Token::Comma) {
+                while !matches!(self.current(), Token::RBrace) {
+                    fields.push(self.parse_object_pattern_field()?);
+                    if matches!(self.current(), Token::Comma) {
                         self.advance();
-                        let key = match self.advance() {
-                            Token::Ident(k) => k,
-                            other => {
-                                return Err(self.error(format!(
-                                    "expected field name in pattern, got {:?}",
-                                    other
-                                )))
-                            }
-                        };
-                        self.expect(&Token::Colon)?;
-                        let pat = self.parse_pattern()?;
-                        fields.push((key, pat));
+                    } else {
+                        break;
                     }
                 }
                 self.expect(&Token::RBrace)?;
@@ -801,6 +786,21 @@ impl Parser {
             _ => Err(self.error(format!(
                 "expected pattern ($var, [...], or {{...}}), got {:?}",
                 self.current()
+            ))),
+        }
+    }
+
+    fn parse_object_pattern_field(&mut self) -> Result<(String, Pattern), QfError> {
+        match self.advance() {
+            Token::Variable(name) => Ok((name.clone(), Pattern::Variable(name))),
+            Token::Ident(key) | Token::String(key) => {
+                self.expect(&Token::Colon)?;
+                let pat = self.parse_pattern()?;
+                Ok((key, pat))
+            }
+            other => Err(self.error(format!(
+                "expected field name or $variable in pattern, got {:?}",
+                other
             ))),
         }
     }
@@ -971,6 +971,181 @@ mod tests {
                     Box::new(Expr::VarRef("x".into())),
                 )),
             }
+        );
+    }
+
+    #[test]
+    fn parse_label_and_break() {
+        let expr = parse_expr("label $out | (1, break $out, 2)");
+        assert_eq!(
+            expr,
+            Expr::Label(
+                "out".into(),
+                Box::new(Expr::Comma(
+                    Box::new(Expr::Comma(
+                        Box::new(Expr::Literal(serde_json::Value::Number(1.into()))),
+                        Box::new(Expr::Break("out".into())),
+                    )),
+                    Box::new(Expr::Literal(serde_json::Value::Number(2.into()))),
+                )),
+            )
+        );
+
+        let piped = parse_expr(". | label $out | break $out");
+        assert_eq!(
+            piped,
+            Expr::Pipe(
+                Box::new(Expr::Identity),
+                Box::new(Expr::Label(
+                    "out".into(),
+                    Box::new(Expr::Break("out".into())),
+                )),
+            )
+        );
+
+        let res = crate::query::query(&serde_json::Value::Null, "label $out | (1, 2, break $out, 3)").unwrap();
+        assert_eq!(res, vec![serde_json::json!(1), serde_json::json!(2)]);
+    }
+
+    #[test]
+    fn parse_object_destructuring_shorthand() {
+        let expr = parse_expr(". as {$a} | $a");
+        assert_eq!(
+            expr,
+            Expr::As {
+                expr: Box::new(Expr::Identity),
+                pattern: Pattern::Object(vec![("a".into(), Pattern::Variable("a".into()))]),
+                body: Box::new(Expr::VarRef("a".into())),
+            }
+        );
+
+        let mixed = parse_expr(". as {a: $x, $b} | [$x, $b]");
+        assert_eq!(
+            mixed,
+            Expr::As {
+                expr: Box::new(Expr::Identity),
+                pattern: Pattern::Object(vec![
+                    ("a".into(), Pattern::Variable("x".into())),
+                    ("b".into(), Pattern::Variable("b".into())),
+                ]),
+                body: Box::new(Expr::ArrayConstruct(Box::new(Expr::Comma(
+                    Box::new(Expr::VarRef("x".into())),
+                    Box::new(Expr::VarRef("b".into())),
+                )))),
+            }
+        );
+
+        let val = serde_json::json!({"a": 10, "b": 20});
+        assert_eq!(
+            crate::query::query(&val, ". as {$a} | $a").unwrap(),
+            vec![serde_json::json!(10)]
+        );
+        assert_eq!(
+            crate::query::query(&val, ". as {a: $x, $b} | [$x, $b]").unwrap(),
+            vec![serde_json::json!([10, 20])]
+        );
+    }
+
+    #[test]
+    fn parse_and_eval_format_string_interpolation() {
+        assert_eq!(
+            crate::query::query(&serde_json::json!("hi"), r#"@json "x\(.)""#).unwrap(),
+            vec![serde_json::json!(r#"x"hi""#)]
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::json!(42), r#"@text "v=\(.)""#).unwrap(),
+            vec![serde_json::json!("v=42")]
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::json!([1, "a,b"]), r#"@csv "\(.)""#).unwrap(),
+            vec![serde_json::json!("1,\"a,b\"")]
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::json!("a b"), r#"@uri "q=\(.)""#).unwrap(),
+            vec![serde_json::json!("q=a%20b")]
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::json!("a & b"), r#"@html "<b>\(.)</b>""#).unwrap(),
+            vec![serde_json::json!("<b>a &amp; b</b>")]
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::json!("hi"), r#"@base64 "\(.)""#).unwrap(),
+            vec![serde_json::json!("aGk=")]
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::Value::Null, r#"@json "plain""#).unwrap(),
+            vec![serde_json::json!("plain")]
+        );
+    }
+
+    #[test]
+    fn parse_quoted_field_chains() {
+        let expr = parse_expr(r#".a."b""#);
+        assert_eq!(
+            expr,
+            Expr::Pipe(
+                Box::new(Expr::Field("a".into())),
+                Box::new(Expr::Field("b".into())),
+            )
+        );
+
+        let opt = parse_expr(r#".a."b-c"?"#);
+        assert_eq!(
+            opt,
+            Expr::Pipe(
+                Box::new(Expr::Field("a".into())),
+                Box::new(Expr::OptionalField("b-c".into())),
+            )
+        );
+
+        let val = serde_json::json!({"a": {"b": {"c-d": 99}}});
+        assert_eq!(
+            crate::query::query(&val, r#".a."b"."c-d""#).unwrap(),
+            vec![serde_json::json!(99)]
+        );
+    }
+
+    #[test]
+    fn parse_and_eval_optional_chaining() {
+        let expr = parse_expr(".[]?.x");
+        assert_eq!(
+            expr,
+            Expr::Pipe(
+                Box::new(Expr::OptionalIterate(Box::new(Expr::Identity))),
+                Box::new(Expr::Field("x".into())),
+            )
+        );
+
+        let idx_expr = parse_expr(".[0]?.x");
+        assert_eq!(
+            idx_expr,
+            Expr::Pipe(
+                Box::new(Expr::OptionalIndex(
+                    Box::new(Expr::Identity),
+                    Box::new(Expr::Literal(serde_json::Value::Number(0.into()))),
+                )),
+                Box::new(Expr::Field("x".into())),
+            )
+        );
+
+        // Non-iterable input produces empty without error
+        assert_eq!(
+            crate::query::query(&serde_json::json!(42), ".[]?.x").unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(
+            crate::query::query(&serde_json::json!(42), ".[0]?.x").unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+        // Matching array input extracts .x
+        let arr = serde_json::json!([{"x": 1}, {"x": 2}]);
+        assert_eq!(
+            crate::query::query(&arr, ".[]?.x").unwrap(),
+            vec![serde_json::json!(1), serde_json::json!(2)]
+        );
+        assert_eq!(
+            crate::query::query(&arr, ".[0]?.x").unwrap(),
+            vec![serde_json::json!(1)]
         );
     }
 }
