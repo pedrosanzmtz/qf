@@ -795,7 +795,7 @@ fn should_colorize(cli: &Cli) -> bool {
     if cli.color_always || cli.color == ColorMode::Always {
         return true;
     }
-    if std::env::var("NO_COLOR").is_ok() {
+    if std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()) {
         return false;
     }
     io::stdout().is_terminal()
