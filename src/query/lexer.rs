@@ -15,46 +15,46 @@ pub enum Token {
     Format(String),   // @base64, @csv, etc.
 
     // Operators
-    Dot,        // .
-    Pipe,       // |
-    Comma,      // ,
-    Colon,      // :
-    Semicolon,  // ;
-    Question,   // ?
-    DotDot,     // .. (recursive descent)
+    Dot,       // .
+    Pipe,      // |
+    Comma,     // ,
+    Colon,     // :
+    Semicolon, // ;
+    Question,  // ?
+    DotDot,    // .. (recursive descent)
 
     // Brackets
-    LParen,     // (
-    RParen,     // )
-    LBracket,   // [
-    RBracket,   // ]
-    LBrace,     // {
-    RBrace,     // }
+    LParen,   // (
+    RParen,   // )
+    LBracket, // [
+    RBracket, // ]
+    LBrace,   // {
+    RBrace,   // }
 
     // Arithmetic
-    Plus,       // +
-    Minus,      // -
-    Star,       // *
-    Slash,      // /
-    Percent,    // %
+    Plus,    // +
+    Minus,   // -
+    Star,    // *
+    Slash,   // /
+    Percent, // %
 
     // Comparison
-    Eq,         // ==
-    Ne,         // !=
-    Lt,         // <
-    Le,         // <=
-    Gt,         // >
-    Ge,         // >=
+    Eq, // ==
+    Ne, // !=
+    Lt, // <
+    Le, // <=
+    Gt, // >
+    Ge, // >=
 
     // Assignment
-    Assign,     // =
-    UpdateAssign, // |=
-    PlusAssign, // +=
-    MinusAssign, // -=
-    StarAssign, // *=
-    SlashAssign, // /=
+    Assign,        // =
+    UpdateAssign,  // |=
+    PlusAssign,    // +=
+    MinusAssign,   // -=
+    StarAssign,    // *=
+    SlashAssign,   // /=
     PercentAssign, // %=
-    AltAssign,  // //=
+    AltAssign,     // //=
 
     // Logic / keywords
     And,
@@ -163,20 +163,47 @@ impl Lexer {
                         self.tokens.push(Token::Pipe);
                     }
                 }
-                ',' => { self.pos += 1; self.tokens.push(Token::Comma); }
-                ':' => { self.pos += 1; self.tokens.push(Token::Colon); }
-                ';' => { self.pos += 1; self.tokens.push(Token::Semicolon); }
+                ',' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::Comma);
+                }
+                ':' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::Colon);
+                }
+                ';' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::Semicolon);
+                }
                 '?' => {
                     self.pos += 1;
                     // ?// is the "try alternative" operator; we just emit ? and let parser handle
                     self.tokens.push(Token::Question);
                 }
-                '(' => { self.pos += 1; self.tokens.push(Token::LParen); }
-                ')' => { self.pos += 1; self.tokens.push(Token::RParen); }
-                '[' => { self.pos += 1; self.tokens.push(Token::LBracket); }
-                ']' => { self.pos += 1; self.tokens.push(Token::RBracket); }
-                '{' => { self.pos += 1; self.tokens.push(Token::LBrace); }
-                '}' => { self.pos += 1; self.tokens.push(Token::RBrace); }
+                '(' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::LParen);
+                }
+                ')' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::RParen);
+                }
+                '[' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::LBracket);
+                }
+                ']' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::RBracket);
+                }
+                '{' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::LBrace);
+                }
+                '}' => {
+                    self.pos += 1;
+                    self.tokens.push(Token::RBrace);
+                }
                 '+' => {
                     self.pos += 1;
                     if self.peek_current() == Some('=') {
@@ -599,8 +626,17 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::Eq, Token::Ne, Token::Lt, Token::Le, Token::Gt, Token::Ge,
-                Token::Plus, Token::Minus, Token::Star, Token::Slash, Token::Percent,
+                Token::Eq,
+                Token::Ne,
+                Token::Lt,
+                Token::Le,
+                Token::Gt,
+                Token::Ge,
+                Token::Plus,
+                Token::Minus,
+                Token::Star,
+                Token::Slash,
+                Token::Percent,
                 Token::Eof,
             ]
         );
@@ -612,8 +648,14 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::If, Token::Then, Token::Else, Token::End,
-                Token::And, Token::Or, Token::Not, Token::Eof,
+                Token::If,
+                Token::Then,
+                Token::Else,
+                Token::End,
+                Token::And,
+                Token::Or,
+                Token::Not,
+                Token::Eof,
             ]
         );
     }
@@ -621,7 +663,10 @@ mod tests {
     #[test]
     fn lex_string() {
         let tokens = lex(r#""hello world""#);
-        assert_eq!(tokens, vec![Token::String("hello world".into()), Token::Eof]);
+        assert_eq!(
+            tokens,
+            vec![Token::String("hello world".into()), Token::Eof]
+        );
     }
 
     #[test]
@@ -658,9 +703,14 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::UpdateAssign, Token::PlusAssign, Token::MinusAssign,
-                Token::StarAssign, Token::SlashAssign, Token::PercentAssign,
-                Token::AltAssign, Token::Eof,
+                Token::UpdateAssign,
+                Token::PlusAssign,
+                Token::MinusAssign,
+                Token::StarAssign,
+                Token::SlashAssign,
+                Token::PercentAssign,
+                Token::AltAssign,
+                Token::Eof,
             ]
         );
     }

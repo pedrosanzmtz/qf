@@ -3,8 +3,7 @@ use serde_json::Value;
 use crate::error::QfError;
 
 pub fn parse(input: &str) -> Result<Value, QfError> {
-    let toml_val: toml::Value =
-        toml::from_str(input).map_err(|e| QfError::Parse(e.to_string()))?;
+    let toml_val: toml::Value = toml::from_str(input).map_err(|e| QfError::Parse(e.to_string()))?;
     Ok(toml_to_json(toml_val))
 }
 
@@ -12,9 +11,7 @@ fn toml_to_json(val: toml::Value) -> Value {
     match val {
         toml::Value::String(s) => Value::String(s),
         toml::Value::Integer(i) => Value::Number(i.into()),
-        toml::Value::Float(f) => {
-            serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)
-        }
+        toml::Value::Float(f) => serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number),
         toml::Value::Boolean(b) => Value::Bool(b),
         toml::Value::Datetime(dt) => Value::String(dt.to_string()),
         toml::Value::Array(arr) => Value::Array(arr.into_iter().map(toml_to_json).collect()),

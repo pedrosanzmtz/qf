@@ -208,10 +208,7 @@ mod tests {
     fn query_group_by() {
         let val = json!([{"a":1},{"a":2},{"a":1}]);
         let results = query(&val, "group_by(.a)").unwrap();
-        assert_eq!(
-            results,
-            vec![json!([[{"a":1},{"a":1}],[{"a":2}]])]
-        );
+        assert_eq!(results, vec![json!([[{"a":1},{"a":1}],[{"a":2}]])]);
     }
 
     #[test]
