@@ -1,6 +1,6 @@
 # qf
 
-A fast, Rust-based universal data format query tool with JQ-compatible syntax. Think [jq](https://github.com/jqlang/jq) + [yq](https://github.com/mikefarah/yq) but faster, unified, and multi-format.
+A fast, Rust-based universal data format query tool with JQ-compatible syntax across YAML, JSON, NDJSON, XML, TOML, CSV, and TSV.
 
 ## Installation
 
@@ -27,16 +27,25 @@ qf [OPTIONS] [QUERY] [FILES...]
 |------|-------------|
 | `-p, --input-format <FORMAT>` | Force input format (`yaml`, `json`, `xml`, `toml`, `csv`, `tsv`) |
 | `-o, --output-format <FORMAT>` | Output format (`yaml`, `json`, `xml`, `toml`, `csv`, `tsv`). Defaults to input format |
-| `-i, --in-place` | Edit file in place |
+| `-i, --in-place` | Edit file(s) in place (lossless comment/formatting preservation for TOML via `toml_edit`) |
 | `-c, --compact` | Compact output (no pretty printing) |
-| `-r, --raw` | Raw string output (no quotes) |
+| `-r, --raw` | Raw string output (no quotes for string values) |
 | `-s, --slurp` | Read all inputs into a JSON array |
 | `-R, --raw-input` | Read raw input lines as strings |
-| `-j, --join-output` | No newlines between outputs |
-| `-n, --null-input` | Use null as input |
+| `-j, --join-output` | No newlines between outputs (implies `-r`) |
+| `-n, --null-input` | Use null as input instead of reading from stdin/files |
+| `-e, --exit-status` | Set exit status based on output (`1` if `false`/`null`, `4` if no output) |
+| `-f, --from-file <PATH>` | Read query from file |
+| `-S, --sort-keys` | Sort object keys alphabetically in output |
+| `--arg <NAME> <VALUE>` | Bind a string variable (`$NAME = VALUE`) |
+| `--argjson <NAME> <JSON>` | Bind a JSON-encoded variable (`$NAME = JSON`) |
+| `--indent <N>` | Use `N` spaces for indentation (JSON output) |
+| `--tab` | Use tabs for indentation (JSON output) |
 | `--color <MODE>` | Colorize output (`auto`, `always`, `never`) |
 | `--no-color` | Disable colorized output |
-| `--stream` | Stream mode: process records one at a time (for large files) |
+| `-C` | Always colorize output (alias for `--color always`) |
+| `-M` | Never colorize output (alias for `--color never`) |
+| `--stream` | Stream mode: process records/elements one at a time (for large files) |
 | `--jsonl` | Read input as NDJSON/JSON Lines |
 
 ### Examples
@@ -117,7 +126,7 @@ echo '5' | qf 'def factorial: if . <= 1 then 1 else . * ((. - 1) | factorial) en
 
 ### Query Syntax
 
-qf implements a substantial subset of the [jq language](https://jqlang.github.io/jq/manual/):
+`qf` implements a substantial subset of the [jq language](https://jqlang.github.io/jq/manual/). See the [Compatibility & Format Mapping Guide](docs/compatibility.md) for the complete list of supported syntax, built-in functions, known divergences from `jq`, and format-specific mapping rules.
 
 #### Paths and Navigation
 
@@ -196,11 +205,13 @@ qf implements a substantial subset of the [jq language](https://jqlang.github.io
 
 **Paths**: `path`, `paths`, `leaf_paths`, `getpath`, `setpath`, `delpaths`, `del`
 
-**Format strings**: `@base64`, `@base64d`, `@uri`, `@csv`, `@tsv`, `@html`, `@json`, `@text`
+**Format strings**: `@base64`, `@base64d`, `@uri`, `@csv`, `@tsv`, `@sh`, `@html`, `@json`, `@text`
 
-**Other**: `env`, `not`, `input`, `inputs`
+**Other**: `env`, `not`, `now`, `todate`, `fromdate`, `walk`, `tostream`, `fromstream`
 
 ## Supported Formats
+
+See [docs/compatibility.md](docs/compatibility.md) for XML (`@attr`, `$text`), CSV/TSV, TOML (including lossless `-i`), YAML (multi-doc & `<<` merge keys), and `--stream` details.
 
 | Format | Read | Write | Stream |
 |--------|------|-------|--------|
@@ -221,8 +232,16 @@ cargo build --release
 ## Testing
 
 ```bash
-cargo test    # 165 tests
+cargo test
 ```
+
+## Roadmap
+
+- Arbitrary-precision number support (`arbitrary_precision` / big-int handling)
+- Module system (`import` / `include`) and streaming `input` / `inputs`
+- Comment-preserving in-place editing (`-i`) for YAML
+- Streaming support for YAML and TOML
+- Published benchmarks comparing `qf` against `jq` and `yq`
 
 ## License
 

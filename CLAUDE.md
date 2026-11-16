@@ -49,8 +49,10 @@ This project leverages experience from **xmlshift** - a Rust-based XML parser bu
 - [x] Merge operations (`--slurp`, `*` operator)
 - [x] Template evaluation (string interpolation)
 - [x] Colorized output (ANSI, TTY-aware, NO_COLOR support)
+- [x] Lossless TOML in-place editing (`-i`) via `toml_edit`
+- [x] `jq` CLI flags (`--arg`, `--argjson`, `-e`, `-f`, `-S`, `-C`, `-M`, `--indent`, `--tab`)
 
-**Test count**: 165 tests, 0 warnings
+See [docs/compatibility.md](docs/compatibility.md) for the full `jq` compatibility matrix, known divergences, format-mapping conventions, and `--stream` behavior.
 
 ## Technical Architecture
 
@@ -58,10 +60,11 @@ This project leverages experience from **xmlshift** - a Rust-based XML parser bu
 ```toml
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 quick-xml = { version = "0.37", features = ["serialize"] }
 toml = "0.8"
+toml_edit = "0.22"
 csv = "1.3"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
@@ -77,21 +80,30 @@ predicates = "3.1"
 
 ### CLI Design
 ```bash
-qf [OPTIONS] <QUERY> [FILES...]
+qf [OPTIONS] [QUERY] [FILES...]
 
 Options:
   -p, --input-format <FORMAT>   Input format [yaml, json, xml, toml, csv, tsv]
   -o, --output-format <FORMAT>  Output format [yaml, json, xml, toml, csv, tsv]
-  -i, --in-place                Edit file in place
+  -i, --in-place                Edit file(s) in place
   -c, --compact                 Compact output (no pretty print)
   -r, --raw                     Output raw strings (no quotes)
   -s, --slurp                   Read all inputs into an array
   -R, --raw-input               Read raw input lines as strings
-  -j, --join-output             No newlines between outputs
+  -j, --join-output             No newlines between outputs (implies -r)
   -n, --null-input              Use null as input
+  -e, --exit-status             Set exit status based on output (1 if false/null, 4 if no output)
+  -f, --from-file <PATH>        Read query from file
+  -S, --sort-keys               Sort object keys alphabetically in output
+      --arg <NAME> <VALUE>      Bind a string variable ($NAME = VALUE)
+      --argjson <NAME> <JSON>   Bind a JSON-encoded variable ($NAME = JSON)
+      --indent <N>              Use N spaces for indentation (JSON output)
+      --tab                     Use tabs for indentation (JSON output)
       --color <MODE>            Colorize output [auto, always, never]
       --no-color                Disable colorized output
-      --stream                  Stream mode (process records one at a time)
+  -C                            Always colorize output (alias for --color always)
+  -M                            Never colorize output (alias for --color never)
+      --stream                  Stream mode (process records/elements one at a time)
       --jsonl                   Read input as NDJSON/JSON Lines
 
 Examples:
@@ -132,6 +144,7 @@ src/
     output/
         mod.rs           # Output module declarations
         pretty.rs        # Pretty printing + format dispatch
+        preserve.rs      # Lossless TOML diff/in-place preservation (toml_edit)
         color.rs         # ANSI colorization for JSON and YAML
     stream/
         mod.rs           # Stream processing dispatch
@@ -158,45 +171,35 @@ The query engine implements a substantial subset of jq:
 - **Control flow**: `if-then-elif-else-end`, `try-catch`, `as $var |`, `reduce`, `foreach`, `label-break`
 - **Functions**: `def name(params): body;`, 80+ built-in functions
 - **Assignment**: `=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`
-- **Format strings**: `@base64`, `@base64d`, `@uri`, `@csv`, `@tsv`, `@html`, `@json`, `@text`
+- **Format strings**: `@base64`, `@base64d`, `@uri`, `@csv`, `@tsv`, `@sh`, `@html`, `@json`, `@text`
 - **Missing keys return null** (jq-compatible behavior)
-
-## Performance Goals
-
-- **Large files** (>100MB): 5-10x faster than mikefarah/yq
-- **Memory usage**: 50% less than mikefarah/yq through streaming
-- **Startup time**: <50ms for simple queries
-- **Binary size**: <10MB static binary
+- See [docs/compatibility.md](docs/compatibility.md) for known divergences and format-mapping details.
 
 ## Testing Strategy
 
-### Unit Tests (165 tests)
+### Unit & Integration Tests
 - Parser tests for each format (YAML, JSON, XML, TOML, CSV, TSV)
 - Lexer, parser, evaluator tests for the JQ engine
 - Built-in function tests
 - Color output tests
 - Stream processing tests
-- Integration tests in `query/mod.rs` covering all major JQ features
+- CLI integration tests in `tests/cli_tests.rs` and query tests in `src/query/mod.rs`
 
 ### Running Tests
 ```bash
-cargo test           # Run all 165 tests
+cargo test             # Run all unit and integration tests
+cargo clippy --all-targets -- -D warnings
 cargo build --release  # Build optimized binary
 ```
 
-## Distribution
+## Roadmap
 
-1. **GitHub Releases**: Pre-built binaries for Linux, macOS, Windows
-2. **Cargo**: `cargo install qf`
-3. **Homebrew**: Formula for macOS users
-4. **Docker**: Containerized version for CI/CD
-
-## Success Metrics
-
-- [ ] Can replace mikefarah/yq in daily workflow
-- [ ] Handles 10GB+ XML files without memory issues
-- [ ] 1000+ GitHub stars (community validation)
-- [ ] Used in production for telecom config processing
+- [ ] Arbitrary-precision number support (`arbitrary_precision` / big-int handling)
+- [ ] Module system (`import` / `include`) and streaming `input` / `inputs`
+- [ ] Comment-preserving in-place editing (`-i`) for YAML
+- [ ] Streaming support for YAML and TOML
+- [ ] Published benchmarks comparing `qf` against `jq` and `yq`
+- [ ] Pre-built release binaries and package manager distribution (Cargo, Homebrew)
 
 ## Related Projects
 
