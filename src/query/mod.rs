@@ -9,15 +9,36 @@ use serde_json::Value;
 
 use crate::error::QfError;
 
+/// A pre-compiled JQ-compatible query that can be evaluated repeatedly
+/// without re-lexing or re-parsing the query string.
+#[derive(Debug, Clone)]
+pub struct CompiledQuery {
+    expr: ast::Expr,
+    env: env::Env,
+}
+
+impl CompiledQuery {
+    /// Lex and parse `query_str` once into a reusable `CompiledQuery`.
+    pub fn compile(query_str: &str) -> Result<Self, QfError> {
+        let mut lex = lexer::Lexer::new(query_str);
+        lex.tokenize()?;
+        let mut parser = jq_parser::Parser::new(lex.tokens);
+        let expr = parser.parse()?;
+        Ok(Self {
+            expr,
+            env: env::Env::new(),
+        })
+    }
+
+    /// Evaluate the compiled query against `input`, returning all output values.
+    pub fn eval(&self, input: &Value) -> Result<Vec<Value>, QfError> {
+        eval::eval(&self.expr, input, &self.env)
+    }
+}
+
 /// Execute a JQ-compatible query string against a JSON Value, returning all output values.
 pub fn query(input: &Value, query_str: &str) -> Result<Vec<Value>, QfError> {
-    // Use the JQ engine for all queries
-    let mut lex = lexer::Lexer::new(query_str);
-    lex.tokenize()?;
-    let mut parser = jq_parser::Parser::new(lex.tokens);
-    let expr = parser.parse()?;
-    let env = env::Env::new();
-    eval::eval(&expr, input, &env)
+    CompiledQuery::compile(query_str)?.eval(input)
 }
 
 #[cfg(test)]
@@ -316,5 +337,18 @@ mod tests {
             serde_json::to_string(&constructed[0]).unwrap(),
             r#"{"b":1,"a":2}"#
         );
+    }
+
+    #[test]
+    fn compiled_query_reused_across_inputs() {
+        let compiled = CompiledQuery::compile(".a + 1").unwrap();
+        assert_eq!(compiled.eval(&json!({"a": 1})).unwrap(), vec![json!(2)]);
+        assert_eq!(compiled.eval(&json!({"a": 10})).unwrap(), vec![json!(11)]);
+        assert_eq!(compiled.eval(&json!({"a": -5})).unwrap(), vec![json!(-4)]);
+    }
+
+    #[test]
+    fn compiled_query_invalid_syntax_errors_at_compile() {
+        assert!(CompiledQuery::compile(".[[").is_err());
     }
 }

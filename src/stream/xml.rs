@@ -1,17 +1,21 @@
+use std::io::{BufRead, Cursor};
+
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde_json::Value;
 
 use crate::error::QfError;
 use crate::parser::xml::ElementBuilder;
-use crate::query;
+use crate::query::CompiledQuery;
 
-/// Stream XML elements, applying the query to each top-level child element.
-pub fn stream_xml<F>(input: &str, query_str: &str, on_result: &mut F) -> Result<(), QfError>
+/// Stream XML elements from a `BufRead` source, applying the query to each top-level child element.
+pub fn stream_xml_reader<R, F>(reader: R, query_str: &str, on_result: &mut F) -> Result<(), QfError>
 where
+    R: BufRead,
     F: FnMut(Value) -> Result<(), QfError>,
 {
-    let mut reader = Reader::from_str(input);
+    let compiled = CompiledQuery::compile(query_str)?;
+    let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
 
     let mut depth: usize = 0;
@@ -39,8 +43,7 @@ where
                         )));
                     }
                     if stack.is_empty() {
-                        let results = query::query(&value, query_str)?;
-                        for result in results {
+                        for result in compiled.eval(&value)? {
                             on_result(result)?;
                         }
                     } else if let Some(parent) = stack.last_mut() {
@@ -54,8 +57,7 @@ where
                     let builder = ElementBuilder::from_start(e)?;
                     let (name, value) = builder.finish();
                     if depth == 1 {
-                        let results = query::query(&value, query_str)?;
-                        for result in results {
+                        for result in compiled.eval(&value)? {
                             on_result(result)?;
                         }
                     } else if let Some(parent) = stack.last_mut() {
@@ -96,6 +98,14 @@ where
     }
 
     Ok(())
+}
+
+/// Stream XML elements, applying the query to each top-level child element.
+pub fn stream_xml<F>(input: &str, query_str: &str, on_result: &mut F) -> Result<(), QfError>
+where
+    F: FnMut(Value) -> Result<(), QfError>,
+{
+    stream_xml_reader(Cursor::new(input.as_bytes()), query_str, on_result)
 }
 
 #[cfg(test)]
@@ -156,5 +166,23 @@ mod tests {
             results,
             vec![json!({"@note": "a & b", "$text": "hello <world>"})]
         );
+    }
+
+    #[test]
+    fn stream_xml_reader_bufread() {
+        let input = "<root><item><v>1</v></item><item><v>2</v></item></root>";
+        let mut results = Vec::new();
+        stream_xml_reader(std::io::BufReader::new(input.as_bytes()), ".v", &mut |v| {
+            results.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(results, vec![json!("1"), json!("2")]);
+    }
+
+    #[test]
+    fn stream_xml_reader_invalid_query_errors_on_empty_input() {
+        let err = stream_xml_reader(Cursor::new(b""), ".[[", &mut |_| Ok(())).unwrap_err();
+        assert!(matches!(err, QfError::SyntaxError { .. }));
     }
 }
